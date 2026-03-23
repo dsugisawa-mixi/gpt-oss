@@ -6,6 +6,11 @@ class TokenGenerator:
         args = EngineArgs(
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=0.85,
+            max_model_len=4096,
+            max_num_seqs=1,
+            enforce_eager=True,
+            kv_cache_dtype="fp8",
         )
         self.engine = LLMEngine.from_engine_args(args)
         self.request_id = 0
@@ -29,6 +34,8 @@ class TokenGenerator:
         last_token_id = []
         while self.engine.has_unfinished_requests():
             step_outputs = self.engine.step()
+            if not step_outputs or not step_outputs[0].outputs:
+                continue
             output = step_outputs[0].outputs[0]
             token_ids = output.token_ids
             logprobs_list = output.logprobs if hasattr(output, "logprobs") else None

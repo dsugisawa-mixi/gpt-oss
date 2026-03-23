@@ -42,7 +42,7 @@ def moe(x, wg, w1, w1_mx, w2, w2_mx, bg, b1, b2, experts_per_token=4, num_expert
     with record_function("wg"):
         logits = matmul_ogs(x, wg, bg, precision_config=pcg)
     with record_function("routing"):
-        rdata, gather_indx, scatter_indx = routing(logits, experts_per_token, simulated_ep=1)
+        rdata, gather_indx, scatter_indx = routing(logits, experts_per_token)
 
     if fused_act:
         assert interleaved, "Fused activation requires interleaved weights"

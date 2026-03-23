@@ -72,7 +72,7 @@ def main(args):
             generator = TorchGenerator(args.checkpoint, device)
         case "vllm":
             from gpt_oss.vllm.token_generator import TokenGenerator as VLLMGenerator
-            generator = VLLMGenerator(args.checkpoint, tensor_parallel_size=2)
+            generator = VLLMGenerator(args.checkpoint, tensor_parallel_size=1)
         case _:
             raise ValueError(f"Invalid backend: {args.backend}")
 
