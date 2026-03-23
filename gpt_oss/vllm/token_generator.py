@@ -6,7 +6,7 @@ class TokenGenerator:
         args = EngineArgs(
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=0.85,
+            gpu_memory_utilization=0.6,
             max_model_len=4096,
             max_num_seqs=1,
             enforce_eager=True,
