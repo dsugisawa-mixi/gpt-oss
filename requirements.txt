@@ -42,7 +42,7 @@ frozenlist==1.8.0
 fsspec==2026.2.0
 gguf==0.18.0
 googleapis-common-protos==1.73.0
--e git+ssh://org-14957082@github.com/openai/gpt-oss.git@599476783c6f88508dab8577808b5ead5cbee8d2#egg=gpt_oss
+-e git+ssh://git@github.com/dsugisawa-mixi/gpt-oss.git#egg=gpt_oss
 grpcio==1.78.0
 h11==0.16.0
 hf-xet==1.4.2

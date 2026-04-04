@@ -33,6 +33,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -95,6 +96,7 @@ You must simultaneously:
 
 # Game World
 World name: "Fields of Light and the Starry Town"
+Zones: Peninsula (zone 1, starting area), Highland (zone 2, Lv4+100G), Lowland (zone 3, Lv8+200G), Coastal (zone 4, Lv10+300G), Wetland (zone 5, Lv12+400G)
 
 ## Zone Rules
 - The current zone description is injected below as "Current Zone".
@@ -121,9 +123,13 @@ Gold: 0 | Monster Stones: 0 | EXP: 0
 ## Magic - The player can say "Cure" to restore HP (costs 1 MP). If HP drops below 30%, gently remind {player_name} to say "Cure".
 ## Death - If HP is 0, the player is dead. Gently remind {player_name} to say "Revive" to come back to life.
 ## Progression - Gain EXP + Gold from monsters. Level up increases stats. Celebrate level-ups warmly.
-## Monsters (early game) - No scary descriptions. Do NOT invent colors or appearances not listed here.
-- Gentle Slime: blue, round, similar to Dragon Quest 1 slime. NOT green.
-- Grass Chick, Rolling Wolf Pup, Echo Mushroom, Playful Bat.
+## Monsters - No scary descriptions. Do NOT invent colors or appearances not listed here.
+- Slime: blue, round, similar to Dragon Quest 1 slime. NOT green. Weakest and slowest. Short melee range.
+- Ramia: a small bird-like creature. Fast (speed 1.5), long attack range (4.0), wide aggro (20.0). Hard to escape once spotted.
+- RedPanthor: a red panther. Very fast (speed 1.8), high ATK (25), 10% critical rate. Dangerous for low-level players.
+- Piccolo: a mysterious tall green creature. Highest ATK (35) and HP (200), 15% critical rate. Slow but deadly up close.
+- Kulilin: a tough bald fighter-type. Fast (speed 1.2), 12% critical rate, wide aggro (12.0). Strong and persistent.
+- See the "Enemies in this zone" section below for exact stats and damage calculations vs the player.
 ## IMPORTANT: Monster positions and spawns are controlled by the game server, not by you. Do NOT make up specific locations or directions for monsters. If asked where a monster is, say you are not sure and suggest looking around.
 ## Monster Stones - Rare drop from monsters. Important collection goal.
 
@@ -148,6 +154,13 @@ app = FastAPI(title="Nanny RPG Server")
 logger = logging.getLogger("nanny")
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    logger.error("Validation error on %s %s: %s", request.method, request.url.path, exc.errors())
+    logger.error("Request body: %s", exc.body)
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
 @app.middleware("http")
 async def log_response_time(request: Request, call_next):
     start = time.perf_counter()
@@ -170,49 +183,217 @@ sessions: dict[str, list[dict[str, str]]] = {}  # user_id -> full message list
 # Stored as-is (array, ordered by id DESC from DB)
 player_status_history: dict[str, list[dict]] = {}  # user_id -> [row, row, ...]
 nicknames: dict[str, str] = {}  # user_id -> nickname
+unlocked_zones: dict[str, list[int]] = {}  # user_id -> [zone_id, ...]
 
 
-# Zone name mapping (extend as needed)
+# EXP table (cumulative EXP required for each level)
+EXP_TABLE = [
+    0, 0, 7, 23, 47, 110, 220, 450, 800, 1300,
+    2000, 2900, 4000, 5500, 7500, 10000, 13000, 17000, 22000, 29000,
+    38000, 48000, 60000, 75000, 90000, 105000, 120000, 135000, 150000, 165000,
+    180000,
+]
+
+# Zone name mapping (matches zones table in MySQL)
 ZONE_NAMES = {
-    1: "Beginning Fields",
-    2: "Little Star Town",
-    3: "Whispering Woods",
-    4: "Crystal Cave",
+    1: "Peninsula",
+    2: "Highland",
+    3: "Lowland",
+    4: "Coastal",
+    5: "Wetland",
 }
 
-# Zone descriptions for system prompt (only describe what actually exists in each zone)
+# Zone unlock requirements (what the player must achieve to unlock each zone)
+# Matches permission column in zones table: {"lv": min_level, "gold": min_gold}
+ZONE_UNLOCK_REQUIREMENTS = {
+    2: {"min_lv": 4, "min_gold": 100, "description": "Reach Level 4 and 100 Gold to enter Highland"},
+    3: {"min_lv": 8, "min_gold": 200, "description": "Reach Level 8 and 200 Gold to enter Lowland"},
+    4: {"min_lv": 10, "min_gold": 300, "description": "Reach Level 10 and 300 Gold to enter Coastal"},
+    5: {"min_lv": 12, "min_gold": 400, "description": "Reach Level 12 and 400 Gold to enter Wetland"},
+}
+
+# Enemy combat parameters (from JS enemy definition files)
+# Used to give the nanny precise knowledge of each enemy's capabilities
+ENEMY_STATS = {
+    "Slime": {
+        "hp": 8, "attack": 7, "defense": 3,
+        "speed": 1.0, "attackRange": 0.6, "aggroRange": 10.0,
+        "criticalRate": 0.0,
+        "exp": 1, "goldDrop": "3-5",
+    },
+    "Ramia": {
+        "hp": 12, "attack": 7, "defense": 5,
+        "speed": 1.5, "attackRange": 4.0, "aggroRange": 20.0,
+        "criticalRate": 0.0,
+        "exp": 2, "goldDrop": "2-4",
+    },
+    "RedPanthor": {
+        "hp": 120, "attack": 25, "defense": 20,
+        "speed": 1.8, "attackRange": 3.0, "aggroRange": 12.0,
+        "criticalRate": 0.10,
+        "exp": 5, "goldDrop": "8-15",
+    },
+    "Piccolo": {
+        "hp": 200, "attack": 35, "defense": 28,
+        "speed": 1.0, "attackRange": 2.5, "aggroRange": 10.0,
+        "criticalRate": 0.15,
+        "exp": 10, "goldDrop": "15-25",
+    },
+    "Kulilin": {
+        "hp": 180, "attack": 30, "defense": 25,
+        "speed": 1.2, "attackRange": 2.0, "aggroRange": 12.0,
+        "criticalRate": 0.12,
+        "exp": 12, "goldDrop": "12-20",
+    },
+}
+
+# Zone enemies (matches zone_enemies table in MySQL)
+# Format: zone_id -> list of (enemy_type, player_lv requirement, count)
+ZONE_ENEMIES = {
+    1: [
+        ("Slime", 1, 3),
+    ],
+    2: [
+        ("Slime", 1, 2),
+        ("Ramia", 1, 3),
+    ],
+    3: [
+        ("Slime", 1, 2),
+        ("Ramia", 1, 2),
+        ("RedPanthor", 1, 2),
+    ],
+    4: [
+        ("Piccolo", 1, 1),
+        ("Kulilin", 1, 1),
+    ],
+}
+
+# Zone descriptions for system prompt
 ZONE_DESCRIPTIONS = {
     1: """\
-## Current Zone: Beginning Fields
-- A flat grass field.
+## Current Zone: Peninsula
+- A flat grass field near the coast.
 - Weak, friendly monsters spawn at random positions.
-- Trees are visible far in the distance but cannot be reached.
-- Little Star Town is visible in the distance but blocked by a blue magic wall (50% transparent).
-- The blue wall opens at Level 3.
+- Highland is visible in the distance but blocked by a magic wall.
 - There is nothing else here. No flowers, no signboards, no NPCs, no items on the ground.""",
     2: """\
-## Current Zone: Little Star Town (first road)
-- The first road leading into the town.
-- A green magic wall blocks further progress into the town.
-- Weapon Shop, Armor Shop, Item Shop, Inn are visible but may be behind the green wall.
+## Current Zone: Highland
+- A hilly terrain with stronger monsters.
+- Weapon Shop, Armor Shop, Item Shop, Inn are available.
 - NPCs: Gant (weapon shop), Mira (inn), Popo (item shop grandma), Tim (young adventurer).""",
-    3: """\
-## Current Zone: Whispering Woods
-- A quiet forest with rustling leaves.
-- Stronger monsters appear here.""",
-    4: """\
-## Current Zone: Crystal Cave
-- A glowing cave with crystals on the walls.
-- Dangerous monsters live here.""",
 }
+
+
+def _format_zone_enemies(zone_id: int, player_attack: int = 3, player_defense: int = 1) -> str:
+    """Format zone enemy table with full combat parameters for the system prompt."""
+    enemies = ZONE_ENEMIES.get(zone_id)
+    if not enemies:
+        return ""
+    lines = [
+        "\n## Enemies in this zone (authoritative game data)",
+        "Use these stats to judge whether the player should fight, flee, or be cautious.",
+        "Damage formula: max(1, attacker_ATK - defender_DEF).",
+    ]
+    for enemy_type, req_lv, count in enemies:
+        s = ENEMY_STATS.get(enemy_type)
+        if not s:
+            lines.append(f"\n### {enemy_type} (x{count}, Lv{req_lv}+)")
+            continue
+        # Calculate danger indicators
+        enemy_dmg_to_player = max(1, s["attack"] - player_defense)
+        player_dmg_to_enemy = max(1, player_attack - s["defense"])
+        hits_to_kill = (s["hp"] + player_dmg_to_enemy - 1) // player_dmg_to_enemy
+        lines.append(f"\n### {enemy_type} (x{count}, spawns at player Lv{req_lv}+)")
+        lines.append(f"  HP: {s['hp']} | ATK: {s['attack']} | DEF: {s['defense']}")
+        lines.append(f"  Speed: {s['speed']} | Attack range: {s['attackRange']} | Aggro range: {s['aggroRange']}")
+        lines.append(f"  Critical rate: {s['criticalRate']*100:.0f}%")
+        lines.append(f"  Rewards: {s['exp']} EXP, {s['goldDrop']} Gold")
+        lines.append(f"  -- vs player now: enemy deals {enemy_dmg_to_player} dmg/hit, player deals {player_dmg_to_enemy} dmg/hit, ~{hits_to_kill} hits to kill")
+    return "\n".join(lines)
+
+
+def _format_exp_table(current_lv: int) -> str:
+    """Format nearby EXP milestones for the system prompt."""
+    lines = ["\n## EXP Table (cumulative EXP needed to reach each level)"]
+    start = max(1, current_lv - 1)
+    end = min(len(EXP_TABLE), current_lv + 4)
+    for lv in range(start, end):
+        marker = " <-- current" if lv == current_lv else ""
+        lines.append(f"  Lv{lv}: {EXP_TABLE[lv]} EXP{marker}")
+    return "\n".join(lines)
+
+
+def _format_zone_progress(unlocked_zones: list[int], current_lv: int, current_exp: int, current_gold: int = 0) -> str:
+    """Format zone unlock progress and next goal for the system prompt."""
+    unlocked_set = set(unlocked_zones)
+    lines = ["\n## Zone Progress"]
+
+    # Show unlocked zones
+    for zid in sorted(unlocked_set):
+        name = ZONE_NAMES.get(zid, f"Zone {zid}")
+        lines.append(f"  {name} (zone {zid}): UNLOCKED")
+
+    # Show locked zones with requirements and progress
+    next_goal = None
+    for zid in sorted(ZONE_NAMES.keys()):
+        if zid in unlocked_set:
+            continue
+        name = ZONE_NAMES.get(zid, f"Zone {zid}")
+        req = ZONE_UNLOCK_REQUIREMENTS.get(zid)
+        if req:
+            min_lv = req["min_lv"]
+            min_gold = req.get("min_gold", 0)
+            lv_met = current_lv >= min_lv
+            gold_met = current_gold >= min_gold
+            if lv_met and gold_met:
+                lines.append(f"  {name} (zone {zid}): LOCKED (requirements met! Lv{current_lv} >= Lv{min_lv}, Gold{current_gold} >= {min_gold}) -- may need a trigger event")
+            else:
+                parts = []
+                if not lv_met:
+                    lvs_needed = min_lv - current_lv
+                    if min_lv < len(EXP_TABLE):
+                        exp_needed = max(0, EXP_TABLE[min_lv] - current_exp)
+                    else:
+                        exp_needed = 0
+                    parts.append(f"Lv{min_lv} ({lvs_needed} more levels, {exp_needed} more EXP)")
+                if not gold_met:
+                    gold_needed = min_gold - current_gold
+                    parts.append(f"{min_gold} Gold ({gold_needed} more Gold)")
+                lines.append(f"  {name} (zone {zid}): LOCKED -- need {' and '.join(parts)}")
+                if next_goal is None:
+                    next_goal = f"Reach Lv{min_lv} and {min_gold} Gold to unlock {name}. Need: {', '.join(parts)}."
+        else:
+            lines.append(f"  {name} (zone {zid}): LOCKED")
+
+    if next_goal:
+        lines.append(f"\n## Next Goal\n{next_goal}")
+        lines.append("Encourage the player to keep fighting monsters and gaining EXP and Gold toward this goal.")
+
+    return "\n".join(lines)
 
 
 # --- Pydantic models ---
+
+class InlinePlayerStatus(BaseModel):
+    """Player status sent inline with each /chat request from game server."""
+    lv: int
+    hp: int
+    maxHp: int
+    mp: int
+    maxMp: int
+    attack: int
+    defense: int
+    exp: int
+    gold: int
+
 
 class ChatRequest(BaseModel):
     user_id: str
     message: str
     nickname: Optional[str] = None
+    playerStatus: Optional[InlinePlayerStatus] = None
+    unlocked_zones: Optional[list[int]] = None
+    unlockedZones: Optional[list[int]] = None  # alias: JS sends camelCase
 
 
 class ChatResponse(BaseModel):
@@ -325,7 +506,11 @@ def get_or_create_session(user_id: str) -> list[dict[str, str]]:
 # Prompt construction  (system + live game state + short-term window)
 # =====================================================================
 
-def build_prompt_messages(user_id: str, history: list[dict[str, str]]) -> list[dict[str, str]]:
+def build_prompt_messages(
+    user_id: str,
+    history: list[dict[str, str]],
+    inline_status: Optional[dict] = None,
+) -> list[dict[str, str]]:
     """
     Build the message list sent to the model:
       1. System prompt + live game state from game server (if available)
@@ -335,16 +520,49 @@ def build_prompt_messages(user_id: str, history: list[dict[str, str]]) -> list[d
     player_name = nicknames.get(user_id, "Adventurer")
     system_content = SYSTEM_PROMPT.replace("{player_name}", player_name)
 
-    # Inject live game state from game server DB
+    # Determine current player stats from available sources
+    current_lv = 1
+    zone_id = 1
+    player_attack = 3   # default starting attack
+    player_defense = 1  # default starting defense
+
+    # Inject live game state from game server DB (POST /game_state history)
     rows = player_status_history.get(user_id)
     if rows:
         system_content += "\n" + status_to_prompt_block(rows)
-        # Inject zone-specific description based on current zone_id
         zone_id = rows[0].get("zone_id", 1)
-    else:
-        zone_id = 1
+        current_lv = rows[0].get("lv", 1)
+        player_attack = rows[0].get("attack", player_attack)
+        player_defense = rows[0].get("defense", player_defense)
+
+    # Inject inline player status from /chat request (real-time snapshot)
+    if inline_status:
+        current_lv = inline_status.get("lv", current_lv)
+        player_attack = inline_status.get("attack", player_attack)
+        player_defense = inline_status.get("defense", player_defense)
+        system_content += f"""
+# Inline Player Status (sent with this request)
+Level: {inline_status['lv']} | HP: {inline_status['hp']}/{inline_status['maxHp']} | MP: {inline_status['mp']}/{inline_status['maxMp']}
+Attack: {inline_status['attack']} | Defense: {inline_status['defense']}
+EXP: {inline_status['exp']} | Gold: {inline_status['gold']}
+"""
+
     zone_desc = ZONE_DESCRIPTIONS.get(zone_id, ZONE_DESCRIPTIONS[1])
     system_content += "\n" + zone_desc
+    system_content += _format_zone_enemies(zone_id, player_attack, player_defense)
+    system_content += _format_exp_table(current_lv)
+
+    # Inject zone progress and next goal
+    user_unlocked = unlocked_zones.get(user_id, [1])  # default: only zone 1
+    current_exp = 0
+    current_gold = 0
+    if inline_status:
+        current_exp = inline_status.get("exp", 0)
+        current_gold = inline_status.get("gold", 0)
+    elif rows:
+        current_exp = rows[0].get("exp", 0)
+        current_gold = rows[0].get("gold", 0)
+    system_content += _format_zone_progress(user_unlocked, current_lv, current_exp, current_gold)
 
     messages = [{"role": "system", "content": system_content}]
 
@@ -361,10 +579,25 @@ def build_prompt_messages(user_id: str, history: list[dict[str, str]]) -> list[d
     else:
         recent = history
 
-    messages.extend(recent)
+    # Sanitize turn structure: merge consecutive same-role messages and
+    # drop empty assistant turns to ensure clean user/assistant alternation.
+    sanitized: list[dict[str, str]] = []
+    for msg in recent:
+        if not msg.get("content", "").strip():
+            continue
+        if sanitized and sanitized[-1]["role"] == msg["role"]:
+            # Merge consecutive messages of the same role
+            sanitized[-1] = {
+                "role": msg["role"],
+                "content": sanitized[-1]["content"] + "\n" + msg["content"],
+            }
+        else:
+            sanitized.append(msg)
+
+    messages.extend(sanitized)
     logger.info(
-        "prompt: user=%s, history=%d msgs, sending=%d msgs (system+%d recent)",
-        user_id, len(history), len(messages), len(recent),
+        "prompt: user=%s, history=%d msgs, sending=%d msgs (system+%d recent, sanitized from %d)",
+        user_id, len(history), len(messages), len(sanitized), len(recent),
     )
     return messages
 
@@ -502,24 +735,42 @@ async def receive_game_event(event: GameEvent):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    logger.info("chat request: %s", req.model_dump())
     # Store nickname if provided
     if req.nickname:
         nicknames[req.user_id] = req.nickname
 
+    # Store unlocked zones if provided (accept both snake_case and camelCase)
+    uzones = req.unlocked_zones if req.unlocked_zones is not None else req.unlockedZones
+    if uzones is not None:
+        unlocked_zones[req.user_id] = uzones
+
     history = get_or_create_session(req.user_id)
 
-    # Add user message to history
-    history.append({"role": "user", "content": req.message})
+    # Detect system-injected messages (e.g. "[System: Player HP is critically low...]")
+    # These come from the game client but should be treated as system instructions, not player input.
+    if req.message.startswith("[System:"):
+        history.append({"role": "system", "content": req.message})
+    else:
+        history.append({"role": "user", "content": req.message})
 
     # Build prompt: system + live game state + last 100 messages
-    prompt_messages = build_prompt_messages(req.user_id, history)
+    inline_status = req.playerStatus.model_dump() if req.playerStatus else None
+    prompt_messages = build_prompt_messages(req.user_id, history, inline_status=inline_status)
     reply = generate_reply(prompt_messages)
 
-    # Strip non-ASCII characters (TTS downstream requires latin-1 safe output)
-    reply = reply.encode("ascii", errors="ignore").decode("ascii")
+    # Strip non-latin1 characters (TTS downstream requires latin-1 safe output)
+    # Keep printable ASCII + common punctuation; replace CJK/emoji with space then collapse
+    import re
+    reply = reply.encode("latin-1", errors="ignore").decode("latin-1")
+    reply = re.sub(r"[^\x20-\x7E\xa0-\xff]", " ", reply)
+    reply = re.sub(r" {2,}", " ", reply).strip()
 
-    # Store reply and persist
-    history.append({"role": "assistant", "content": reply})
+    # Only store non-empty replies to avoid polluting history with blank assistant turns
+    if reply:
+        history.append({"role": "assistant", "content": reply})
+    else:
+        logger.warning("generate: empty reply after ASCII strip for user=%s, skipping history append", req.user_id)
     save_session(req.user_id, history)
 
     return ChatResponse(user_id=req.user_id, reply=reply)
