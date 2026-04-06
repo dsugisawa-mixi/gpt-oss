@@ -7,6 +7,7 @@ Usage:
 Endpoints:
     GET  /              — Simple web UI
     POST /chat          — JSON API: {"user_id": "...", "message": "..."} -> {"reply": "..."}
+    POST /game_config   — Game server pushes zones + zone_enemies tables at startup
     POST /game_state    — Game server pushes player state (from DB) on events
     POST /reset         — Reset conversation history
     GET  /game_state    — View current player state
@@ -20,6 +21,7 @@ Memory system:
 
 import argparse
 import datetime
+import fcntl
 import json
 import logging
 import os
@@ -94,9 +96,18 @@ You must simultaneously:
 - MAXIMUM 10 words per response. Be extremely brief.
 - Do NOT end your response with a question. Just narrate what happens.
 
+# ABSOLUTE RULE — NO INVENTION
+You are FORBIDDEN from generating any game content on your own.
+- NEVER create, spawn, or mention chests, items, NPCs, enemies, buildings, or any objects unless they appear in the "Live Game State" section below.
+- NEVER narrate discoveries, encounters, or events that the game server did not report via [Game Event].
+- You can ONLY describe what the game state and game events tell you. Nothing else exists.
+- If the player says something and no game event matches, respond with encouragement or guidance only. Do NOT make up what happens next.
+- If you have nothing factual to say, respond with a short encouragement like "Keep going!" or "You are doing well."
+- VIOLATION: Inventing a chest, enemy, item, or event = broken game. Never do this.
+
 # Game World
 World name: "Fields of Light and the Starry Town"
-Zones: Peninsula (zone 1, starting area), Highland (zone 2, Lv4+100G), Lowland (zone 3, Lv8+200G), Coastal (zone 4, Lv10+300G), Wetland (zone 5, Lv12+400G)
+Zones: see "Zone Progress" section below for the full list.
 
 ## Zone Rules
 - The current zone description is injected below as "Current Zone".
@@ -184,6 +195,22 @@ sessions: dict[str, list[dict[str, str]]] = {}  # user_id -> full message list
 player_status_history: dict[str, list[dict]] = {}  # user_id -> [row, row, ...]
 nicknames: dict[str, str] = {}  # user_id -> nickname
 unlocked_zones: dict[str, list[int]] = {}  # user_id -> [zone_id, ...]
+scenario_progress: dict[str, dict] = {}  # user_id -> {zone_id: {current, completed, current_step}}
+
+
+def _get_current_scenario_voice(user_id: str) -> str:
+    """Return the voice/gender from the active (non-completed) scenario step, or 'female' as default."""
+    progress = scenario_progress.get(user_id)
+    if not progress:
+        return "female"
+    # Find the first non-completed zone's current_step
+    for _zone_id, zone_info in progress.items():
+        if zone_info.get("completed"):
+            continue
+        step = zone_info.get("current_step")
+        if step:
+            return step.get("voice", "female")
+    return "female"
 
 
 # EXP table (cumulative EXP required for each level)
@@ -194,116 +221,110 @@ EXP_TABLE = [
     180000,
 ]
 
-# Zone name mapping (matches zones table in MySQL)
-ZONE_NAMES = {
-    1: "Peninsula",
-    2: "Highland",
-    3: "Lowland",
-    4: "Coastal",
-    5: "Wetland",
-}
+# Game config state — populated by POST /game_config from game server at startup.
+# Persisted as JSON files under nanny_data/environments/.
+# All reads go through _load_game_config(); writes through _save_game_config().
+ENVIRONMENTS_DIR = DATA_DIR / "environments"
 
-# Zone unlock requirements (what the player must achieve to unlock each zone)
-# Matches permission column in zones table: {"lv": min_level, "gold": min_gold}
-ZONE_UNLOCK_REQUIREMENTS = {
-    2: {"min_lv": 4, "min_gold": 100, "description": "Reach Level 4 and 100 Gold to enter Highland"},
-    3: {"min_lv": 8, "min_gold": 200, "description": "Reach Level 8 and 200 Gold to enter Lowland"},
-    4: {"min_lv": 10, "min_gold": 300, "description": "Reach Level 10 and 300 Gold to enter Coastal"},
-    5: {"min_lv": 12, "min_gold": 400, "description": "Reach Level 12 and 400 Gold to enter Wetland"},
-}
+# File paths for each config component
+_ENV_ZONES_FILE = ENVIRONMENTS_DIR / "zones.json"
+_ENV_ZONE_ENEMIES_FILE = ENVIRONMENTS_DIR / "zone_enemies.json"
+_ENV_ZONE_NAMES_FILE = ENVIRONMENTS_DIR / "zone_names.json"
+_ENV_ZONE_UNLOCK_FILE = ENVIRONMENTS_DIR / "zone_unlock_requirements.json"
+_ENV_ENEMY_STATS_FILE = ENVIRONMENTS_DIR / "enemy_stats.json"
 
-# Enemy combat parameters (from JS enemy definition files)
-# Used to give the nanny precise knowledge of each enemy's capabilities
-ENEMY_STATS = {
-    "Slime": {
-        "hp": 8, "attack": 7, "defense": 3,
-        "speed": 1.0, "attackRange": 0.6, "aggroRange": 10.0,
-        "criticalRate": 0.0,
-        "exp": 1, "goldDrop": "3-5",
-    },
-    "Ramia": {
-        "hp": 12, "attack": 7, "defense": 5,
-        "speed": 1.5, "attackRange": 4.0, "aggroRange": 20.0,
-        "criticalRate": 0.0,
-        "exp": 2, "goldDrop": "2-4",
-    },
-    "RedPanthor": {
-        "hp": 120, "attack": 25, "defense": 20,
-        "speed": 1.8, "attackRange": 3.0, "aggroRange": 12.0,
-        "criticalRate": 0.10,
-        "exp": 5, "goldDrop": "8-15",
-    },
-    "Piccolo": {
-        "hp": 200, "attack": 35, "defense": 28,
-        "speed": 1.0, "attackRange": 2.5, "aggroRange": 10.0,
-        "criticalRate": 0.15,
-        "exp": 10, "goldDrop": "15-25",
-    },
-    "Kulilin": {
-        "hp": 180, "attack": 30, "defense": 25,
-        "speed": 1.2, "attackRange": 2.0, "aggroRange": 12.0,
-        "criticalRate": 0.12,
-        "exp": 12, "goldDrop": "12-20",
-    },
-}
+# Zone descriptions for system prompt (static flavor text, keyed by zone_id)
+ZONE_DESCRIPTIONS: dict[int, str] = {}
 
-# Zone enemies (matches zone_enemies table in MySQL)
-# Format: zone_id -> list of (enemy_type, player_lv requirement, count)
-ZONE_ENEMIES = {
-    1: [
-        ("Slime", 1, 3),
-    ],
-    2: [
-        ("Slime", 1, 2),
-        ("Ramia", 1, 3),
-    ],
-    3: [
-        ("Slime", 1, 2),
-        ("Ramia", 1, 2),
-        ("RedPanthor", 1, 2),
-    ],
-    4: [
-        ("Piccolo", 1, 1),
-        ("Kulilin", 1, 1),
-    ],
-}
 
-# Zone descriptions for system prompt
-ZONE_DESCRIPTIONS = {
-    1: """\
-## Current Zone: Peninsula
-- A flat grass field near the coast.
-- Weak, friendly monsters spawn at random positions.
-- Highland is visible in the distance but blocked by a magic wall.
-- There is nothing else here. No flowers, no signboards, no NPCs, no items on the ground.""",
-    2: """\
-## Current Zone: Highland
-- A hilly terrain with stronger monsters.
-- Weapon Shop, Armor Shop, Item Shop, Inn are available.
-- NPCs: Gant (weapon shop), Mira (inn), Popo (item shop grandma), Tim (young adventurer).""",
-}
+def _flock_write_json(path: Path, data) -> None:
+    """Write JSON to file with exclusive flock."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _flock_read_json(path: Path, default=None):
+    """Read JSON from file with shared flock. Returns default if file missing."""
+    if not path.exists():
+        return default
+    with open(path, "r") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+        try:
+            return json.load(f)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _game_config_ready() -> bool:
+    """Check if game config has been set up (files exist)."""
+    return _ENV_ZONES_FILE.exists() and _ENV_ZONE_ENEMIES_FILE.exists()
+
+
+def _load_zone_names() -> dict[int, str]:
+    raw = _flock_read_json(_ENV_ZONE_NAMES_FILE, {})
+    return {int(k): v for k, v in raw.items()}
+
+
+def _load_zone_unlock_requirements() -> dict[int, dict]:
+    raw = _flock_read_json(_ENV_ZONE_UNLOCK_FILE, {})
+    return {int(k): v for k, v in raw.items()}
+
+
+def _load_enemy_stats() -> dict[str, dict]:
+    return _flock_read_json(_ENV_ENEMY_STATS_FILE, {})
+
+
+def _load_zone_enemies() -> dict[int, list[list]]:
+    """Returns {zone_id: [[enemy_type, player_lv, count], ...]}."""
+    raw = _flock_read_json(_ENV_ZONE_ENEMIES_FILE, {})
+    return {int(k): v for k, v in raw.items()}
 
 
 def _format_zone_enemies(zone_id: int, player_attack: int = 3, player_defense: int = 1) -> str:
-    """Format zone enemy table with full combat parameters for the system prompt."""
-    enemies = ZONE_ENEMIES.get(zone_id)
-    if not enemies:
+    """Format zone enemy table from scenario spawn actions for the system prompt."""
+    zones = _flock_read_json(_ENV_ZONES_FILE, [])
+    enemy_stats = _load_enemy_stats()
+
+    # Find the zone's scenarios
+    zone_scenarios = None
+    for z in zones:
+        if z.get("zone_id") == zone_id:
+            zone_scenarios = z.get("scenarios")
+            break
+    if not zone_scenarios:
         return ""
+
+    # Aggregate spawn actions: {enemy_type: total_count}
+    spawn_totals: dict[str, int] = {}
+    for step in zone_scenarios:
+        if step.get("action") == "spawn":
+            enemy_type = step.get("enemy", "")
+            count = step.get("count", 1)
+            if enemy_type:
+                spawn_totals[enemy_type] = spawn_totals.get(enemy_type, 0) + count
+
+    if not spawn_totals:
+        return ""
+
     lines = [
-        "\n## Enemies in this zone (authoritative game data)",
+        "\n## Enemies in this zone (from scenario spawns)",
         "Use these stats to judge whether the player should fight, flee, or be cautious.",
         "Damage formula: max(1, attacker_ATK - defender_DEF).",
     ]
-    for enemy_type, req_lv, count in enemies:
-        s = ENEMY_STATS.get(enemy_type)
+    for enemy_type, total_count in spawn_totals.items():
+        s = enemy_stats.get(enemy_type)
         if not s:
-            lines.append(f"\n### {enemy_type} (x{count}, Lv{req_lv}+)")
+            lines.append(f"\n### {enemy_type} (x{total_count})")
             continue
-        # Calculate danger indicators
         enemy_dmg_to_player = max(1, s["attack"] - player_defense)
         player_dmg_to_enemy = max(1, player_attack - s["defense"])
         hits_to_kill = (s["hp"] + player_dmg_to_enemy - 1) // player_dmg_to_enemy
-        lines.append(f"\n### {enemy_type} (x{count}, spawns at player Lv{req_lv}+)")
+        lines.append(f"\n### {enemy_type} (x{total_count} total in scenario)")
         lines.append(f"  HP: {s['hp']} | ATK: {s['attack']} | DEF: {s['defense']}")
         lines.append(f"  Speed: {s['speed']} | Attack range: {s['attackRange']} | Aggro range: {s['aggroRange']}")
         lines.append(f"  Critical rate: {s['criticalRate']*100:.0f}%")
@@ -323,23 +344,78 @@ def _format_exp_table(current_lv: int) -> str:
     return "\n".join(lines)
 
 
+def _format_scenario_context(user_id: str, zone_id: int) -> str:
+    """Format scenario context for the current zone, showing where the player is in the script."""
+    # Load scenarios from zones.json
+    zones = _flock_read_json(_ENV_ZONES_FILE, [])
+    zone_scenarios = None
+    zone_name = ""
+    for z in zones:
+        if z.get("zone_id") == zone_id:
+            zone_scenarios = z.get("scenarios")
+            zone_name = z.get("name", f"Zone {zone_id}")
+            break
+    if not zone_scenarios:
+        return ""
+
+    progress = scenario_progress.get(user_id, {})
+    zone_prog = progress.get(str(zone_id), {})
+    current_step_id = zone_prog.get("current")
+    completed = zone_prog.get("completed", False)
+
+    lines = [f"\n# Scenario — {zone_name}"]
+    if completed:
+        lines.append("Status: COMPLETED (all steps done)")
+        return "\n".join(lines)
+
+    # Find current step index
+    current_idx = 0
+    if current_step_id:
+        for i, s in enumerate(zone_scenarios):
+            if s.get("step_id") == current_step_id:
+                current_idx = i
+                break
+
+    # Show a window: 2 completed + current + 2 upcoming
+    start = max(0, current_idx - 2)
+    end = min(len(zone_scenarios), current_idx + 3)
+    lines.append(f"Progress: step {current_step_id or '000'} of {len(zone_scenarios)} steps")
+
+    for i in range(start, end):
+        s = zone_scenarios[i]
+        sid = s.get("step_id", str(i).zfill(3))
+        action = s.get("action", "?")
+        msg = s.get("message", "")
+        voice = s.get("voice", "")
+        marker = " <<< CURRENT" if i == current_idx else ""
+        if action == "message" and msg:
+            lines.append(f"  [{sid}] {action}: \"{msg}\" (voice={voice}){marker}")
+        else:
+            lines.append(f"  [{sid}] {action}{marker}")
+
+    lines.append("IMPORTANT: Follow this scenario. Do NOT narrate anything beyond the current step.")
+    return "\n".join(lines)
+
+
 def _format_zone_progress(unlocked_zones: list[int], current_lv: int, current_exp: int, current_gold: int = 0) -> str:
     """Format zone unlock progress and next goal for the system prompt."""
+    zone_names = _load_zone_names()
+    zone_unlock = _load_zone_unlock_requirements()
     unlocked_set = set(unlocked_zones)
     lines = ["\n## Zone Progress"]
 
     # Show unlocked zones
     for zid in sorted(unlocked_set):
-        name = ZONE_NAMES.get(zid, f"Zone {zid}")
+        name = zone_names.get(zid, f"Zone {zid}")
         lines.append(f"  {name} (zone {zid}): UNLOCKED")
 
     # Show locked zones with requirements and progress
     next_goal = None
-    for zid in sorted(ZONE_NAMES.keys()):
+    for zid in sorted(zone_names.keys()):
         if zid in unlocked_set:
             continue
-        name = ZONE_NAMES.get(zid, f"Zone {zid}")
-        req = ZONE_UNLOCK_REQUIREMENTS.get(zid)
+        name = zone_names.get(zid, f"Zone {zid}")
+        req = zone_unlock.get(zid)
         if req:
             min_lv = req["min_lv"]
             min_gold = req.get("min_gold", 0)
@@ -399,6 +475,34 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     user_id: str
     reply: str
+    gender: str = "female"   # TTS voice: "male" or "female"
+    action: str = "message"  # scenario action type
+
+
+class ZoneRow(BaseModel):
+    """Row from MySQL zones table."""
+    zone_id: int
+    name: str
+    wall_height: Optional[float] = None
+    unlock_condition: Optional[str] = None   # JSON string or null
+    permission: Optional[str] = None         # JSON string e.g. '{"lv": 4, "gold": 100}'
+    scenarios: Optional[list] = None         # scenario steps for this zone
+
+
+class ZoneEnemyRow(BaseModel):
+    """Row from MySQL zone_enemies table."""
+    id: Optional[int] = None
+    zone_id: int
+    enemy_type: str
+    player_lv: int = 1
+    count: int = 1
+    spawn_points: Optional[str] = None
+
+
+class GameConfigRequest(BaseModel):
+    """Game server pushes zone + zone_enemies tables at startup."""
+    zones: list[ZoneRow]
+    zone_enemies: list[ZoneEnemyRow]
 
 
 class PlayerStatusRow(BaseModel):
@@ -427,6 +531,7 @@ class GameEvent(BaseModel):
     event_type: str          # e.g. "combat", "level_up", "item_pickup", "quest", "zone_change", "death", "respawn"
     description: str         # human-readable description
     player_status: list[PlayerStatusRow]  # current status array from DB
+    scenario_progress: Optional[dict] = None  # {zone_id: {current, completed, current_step:{id,action,text,voice,tts}}}
 
 
 # =====================================================================
@@ -441,8 +546,9 @@ def status_to_prompt_block(rows: list[dict]) -> str:
     if not rows:
         return ""
 
+    zone_names = _load_zone_names()
     latest = rows[0]
-    zone = ZONE_NAMES.get(latest.get("zone_id", 0), f"Zone {latest.get('zone_id', '?')}")
+    zone = zone_names.get(latest.get("zone_id", 0), f"Zone {latest.get('zone_id', '?')}")
     dead_str = " ** DEAD — needs to be revived! **" if latest.get("is_dead") else ""
 
     block = f"""
@@ -460,7 +566,7 @@ Last updated: {latest['updated_at']}
     if len(rows) > 1:
         block += "\n## Recent Status History (newest first)\n"
         for row in rows[1:10]:  # show up to 9 previous entries
-            z = ZONE_NAMES.get(row.get("zone_id", 0), f"Zone {row.get('zone_id', '?')}")
+            z = zone_names.get(row.get("zone_id", 0), f"Zone {row.get('zone_id', '?')}")
             block += (
                 f"  id={row['id']}: Lv{row['lv']} HP{row['hp']}/{row['max_hp']} "
                 f"MP{row['mp']}/{row['max_mp']} ATK{row['attack']} DEF{row['defense']} "
@@ -547,7 +653,8 @@ Attack: {inline_status['attack']} | Defense: {inline_status['defense']}
 EXP: {inline_status['exp']} | Gold: {inline_status['gold']}
 """
 
-    zone_desc = ZONE_DESCRIPTIONS.get(zone_id, ZONE_DESCRIPTIONS[1])
+    zone_name = _load_zone_names().get(zone_id, f"Zone {zone_id}")
+    zone_desc = ZONE_DESCRIPTIONS.get(zone_id, f"## Current Zone: {zone_name}")
     system_content += "\n" + zone_desc
     system_content += _format_zone_enemies(zone_id, player_attack, player_defense)
     system_content += _format_exp_table(current_lv)
@@ -563,6 +670,7 @@ EXP: {inline_status['exp']} | Gold: {inline_status['gold']}
         current_exp = rows[0].get("exp", 0)
         current_gold = rows[0].get("gold", 0)
     system_content += _format_zone_progress(user_unlocked, current_lv, current_exp, current_gold)
+    system_content += _format_scenario_context(user_id, zone_id)
 
     messages = [{"role": "system", "content": system_content}]
 
@@ -579,20 +687,42 @@ EXP: {inline_status['exp']} | Gold: {inline_status['gold']}
     else:
         recent = history
 
-    # Sanitize turn structure: merge consecutive same-role messages and
-    # drop empty assistant turns to ensure clean user/assistant alternation.
+    # Sanitize turn structure: merge consecutive same-role messages,
+    # condense repetitive game events, and drop empty turns.
     sanitized: list[dict[str, str]] = []
     for msg in recent:
-        if not msg.get("content", "").strip():
+        content = msg.get("content", "").strip()
+        if not content:
             continue
         if sanitized and sanitized[-1]["role"] == msg["role"]:
             # Merge consecutive messages of the same role
             sanitized[-1] = {
                 "role": msg["role"],
-                "content": sanitized[-1]["content"] + "\n" + msg["content"],
+                "content": sanitized[-1]["content"] + "\n" + content,
             }
         else:
-            sanitized.append(msg)
+            sanitized.append({"role": msg["role"], "content": content})
+
+    # Condense game event blocks: count repeated enemy_killed lines
+    for i, msg in enumerate(sanitized):
+        if msg["role"] != "system" or "[Game Event:" not in msg["content"]:
+            continue
+        lines = msg["content"].split("\n")
+        if len(lines) <= 3:
+            continue
+        # Count kills by enemy type
+        kill_counts: dict[str, int] = {}
+        other_lines: list[str] = []
+        for line in lines:
+            if "[Game Event: enemy_killed] Defeated " in line:
+                enemy = line.split("Defeated ", 1)[1].strip()
+                kill_counts[enemy] = kill_counts.get(enemy, 0) + 1
+            else:
+                other_lines.append(line)
+        if kill_counts:
+            summary_parts = [f"{name} x{count}" for name, count in kill_counts.items()]
+            other_lines.append(f"[Game Event: enemy_killed] Defeated: {', '.join(summary_parts)}")
+        sanitized[i] = {"role": msg["role"], "content": "\n".join(other_lines)}
 
     messages.extend(sanitized)
     logger.info(
@@ -649,7 +779,16 @@ def _to_harmony_messages(prompt_messages: list[dict[str, str]]) -> list[Message]
     return harmony_msgs
 
 
-def generate_reply(prompt_messages: list[dict[str, str]], max_new_tokens: int = 40) -> str:
+def generate_reply(
+    prompt_messages: list[dict[str, str]],
+    max_new_tokens: int = 80,
+    max_reply_tokens: int = 20,
+) -> str:
+    """
+    Generate a reply.
+    max_new_tokens: total budget including reasoning + final content.
+    max_reply_tokens: hard cap on final-channel tokens (visible reply).
+    """
     t0 = time.perf_counter()
 
     # Encode conversation with Harmony protocol
@@ -664,18 +803,25 @@ def generate_reply(prompt_messages: list[dict[str, str]], max_new_tokens: int = 
 
     t1 = time.perf_counter()
 
-    # Generate via Triton backend (CUDA graph + triton_kernels MoE)
+    # Generate via vLLM backend
     parser = StreamableParser(encoding, role=Role.ASSISTANT)
     reply_parts: list[str] = []
     gen_count = 0
+    final_token_count = 0
+    channels_seen: set[str] = set()
 
     for predicted_token in generator.generate(
         tokens, stop_tokens=stop_tokens, temperature=0.7, max_tokens=max_new_tokens
     ):
         parser.process(predicted_token)
         gen_count += 1
+        if parser.current_channel:
+            channels_seen.add(parser.current_channel)
         if parser.last_content_delta and parser.current_channel == "final":
             reply_parts.append(parser.last_content_delta)
+            final_token_count += 1
+            if final_token_count >= max_reply_tokens:
+                break
 
     t2 = time.perf_counter()
 
@@ -684,10 +830,12 @@ def generate_reply(prompt_messages: list[dict[str, str]], max_new_tokens: int = 
     tok_per_sec = gen_count / (t2 - t1) if (t2 - t1) > 0 else 0
 
     logger.info(
-        "generate: input=%d tokens, output=%d tokens, "
-        "encode=%.1fms, generate=%.1fms (%.1f tok/s), total=%.1fms",
-        len(tokens), gen_count,
+        "generate: input=%d tokens, output=%d tokens (final=%d), "
+        "encode=%.1fms, generate=%.1fms (%.1f tok/s), total=%.1fms, "
+        "channels=%s, reply_len=%d",
+        len(tokens), gen_count, final_token_count,
         (t1 - t0) * 1000, gen_ms, tok_per_sec, (t2 - t0) * 1000,
+        channels_seen, len(reply),
     )
 
     return reply
@@ -696,6 +844,73 @@ def generate_reply(prompt_messages: list[dict[str, str]], max_new_tokens: int = 
 # =====================================================================
 # Endpoints
 # =====================================================================
+
+@app.post("/game_config")
+async def receive_game_config(cfg: GameConfigRequest):
+    """
+    Game server pushes zones + zone_enemies tables at startup.
+    Persists to nanny_data/environments/ as JSON files with flock.
+    All consumers read from these files on each request.
+    """
+    # --- Build derived dicts from zones rows ---
+    new_zone_names: dict[int, str] = {}
+    new_zone_unlock: dict[int, dict] = {}
+    raw_zones: list[dict] = []
+
+    for z in cfg.zones:
+        new_zone_names[z.zone_id] = z.name
+        raw_zones.append(z.model_dump())
+
+        # Parse permission JSON -> unlock requirements
+        if z.permission:
+            try:
+                perm = json.loads(z.permission) if isinstance(z.permission, str) else z.permission
+            except (json.JSONDecodeError, TypeError):
+                perm = {}
+            min_lv = perm.get("lv", 0)
+            min_gold = perm.get("gold", 0)
+            if min_lv > 0 or min_gold > 0:
+                new_zone_unlock[z.zone_id] = {
+                    "min_lv": min_lv,
+                    "min_gold": min_gold,
+                    "description": f"Reach Level {min_lv} and {min_gold} Gold to enter {z.name}",
+                }
+
+        # Parse unlock_condition JSON if present
+        if z.unlock_condition:
+            try:
+                cond = json.loads(z.unlock_condition) if isinstance(z.unlock_condition, str) else z.unlock_condition
+            except (json.JSONDecodeError, TypeError):
+                cond = None
+            if cond and z.zone_id in new_zone_unlock:
+                new_zone_unlock[z.zone_id]["unlock_condition"] = cond
+            elif cond:
+                new_zone_unlock[z.zone_id] = {"min_lv": 0, "min_gold": 0, "unlock_condition": cond}
+
+    # --- Build zone_enemies dict ---
+    new_zone_enemies: dict[int, list[list]] = {}
+    for ze in cfg.zone_enemies:
+        new_zone_enemies.setdefault(ze.zone_id, []).append(
+            [ze.enemy_type, ze.player_lv, ze.count]
+        )
+
+    # --- Persist all to JSON files with flock ---
+    _flock_write_json(_ENV_ZONES_FILE, raw_zones)
+    _flock_write_json(_ENV_ZONE_NAMES_FILE, new_zone_names)
+    _flock_write_json(_ENV_ZONE_UNLOCK_FILE, new_zone_unlock)
+    _flock_write_json(_ENV_ZONE_ENEMIES_FILE, new_zone_enemies)
+
+    logger.info(
+        "game_config: loaded %d zones, %d zone_enemy entries. ZONE_NAMES=%s",
+        len(cfg.zones), len(cfg.zone_enemies), new_zone_names,
+    )
+    return {
+        "status": "ok",
+        "zones": len(cfg.zones),
+        "zone_enemies": len(cfg.zone_enemies),
+        "zone_names": new_zone_names,
+    }
+
 
 @app.post("/game_state")
 async def receive_game_state(rows: list[PlayerStatusRow]):
@@ -717,17 +932,40 @@ async def receive_game_event(event: GameEvent):
     The event description is injected into the conversation as a system message
     so the nanny can react naturally to what just happened in-game.
     """
+    if not _game_config_ready():
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Service not ready: game_config has not been set up. POST /game_config first."},
+        )
     # Update player status history
     if event.player_status:
         user_id = event.user_id
         player_status_history[user_id] = [r.model_dump() for r in event.player_status]
 
-    # Inject event into conversation history as a system-level note
+    # Update scenario progress
+    if event.scenario_progress:
+        scenario_progress[event.user_id] = event.scenario_progress
+        logger.info("scenario_progress updated for user=%s: %s", event.user_id, event.scenario_progress)
+
+    # Inject event into conversation history as a system-level note.
+    # For high-frequency events (enemy_killed), merge consecutive ones into
+    # a single summary to avoid flooding the history window.
     history = get_or_create_session(event.user_id)
-    history.append({
-        "role": "system",
-        "content": f"[Game Event: {event.event_type}] {event.description}",
-    })
+
+    event_msg = f"[Game Event: {event.event_type}] {event.description}"
+
+    if event.event_type == "enemy_killed":
+        # Merge with the last message if it's also an enemy_killed event
+        if (history
+                and history[-1]["role"] == "system"
+                and history[-1]["content"].startswith("[Game Event: enemy_killed]")):
+            # Append to existing kill summary
+            history[-1]["content"] += f"\n{event_msg}"
+        else:
+            history.append({"role": "system", "content": event_msg})
+    else:
+        history.append({"role": "system", "content": event_msg})
+
     save_session(event.user_id, history)
 
     return {"status": "ok", "user_id": event.user_id, "event_type": event.event_type}
@@ -735,6 +973,11 @@ async def receive_game_event(event: GameEvent):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    if not _game_config_ready():
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Service not ready: game_config has not been set up. POST /game_config first."},
+        )
     logger.info("chat request: %s", req.model_dump())
     # Store nickname if provided
     if req.nickname:
@@ -761,7 +1004,7 @@ async def chat(req: ChatRequest):
 
     # Strip non-latin1 characters (TTS downstream requires latin-1 safe output)
     # Keep printable ASCII + common punctuation; replace CJK/emoji with space then collapse
-    import re
+    raw_reply = reply
     reply = reply.encode("latin-1", errors="ignore").decode("latin-1")
     reply = re.sub(r"[^\x20-\x7E\xa0-\xff]", " ", reply)
     reply = re.sub(r" {2,}", " ", reply).strip()
@@ -770,10 +1013,15 @@ async def chat(req: ChatRequest):
     if reply:
         history.append({"role": "assistant", "content": reply})
     else:
-        logger.warning("generate: empty reply after ASCII strip for user=%s, skipping history append", req.user_id)
+        logger.warning(
+            "generate: empty reply after latin-1 strip for user=%s. "
+            "Raw reply (%d chars): %r",
+            req.user_id, len(raw_reply), raw_reply[:200],
+        )
     save_session(req.user_id, history)
 
-    return ChatResponse(user_id=req.user_id, reply=reply)
+    gender = _get_current_scenario_voice(req.user_id)
+    return ChatResponse(user_id=req.user_id, reply=reply, gender=gender)
 
 
 @app.post("/reset")
@@ -935,12 +1183,20 @@ def main():
     args = parser.parse_args()
 
     # Set up data directories
-    global DATA_DIR, SESSIONS_DIR
+    global DATA_DIR, SESSIONS_DIR, ENVIRONMENTS_DIR
+    global _ENV_ZONES_FILE, _ENV_ZONE_ENEMIES_FILE, _ENV_ZONE_NAMES_FILE, _ENV_ZONE_UNLOCK_FILE, _ENV_ENEMY_STATS_FILE
     DATA_DIR = Path(args.data_dir)
     SESSIONS_DIR = DATA_DIR / "sessions"
+    ENVIRONMENTS_DIR = DATA_DIR / "environments"
+    _ENV_ZONES_FILE = ENVIRONMENTS_DIR / "zones.json"
+    _ENV_ZONE_ENEMIES_FILE = ENVIRONMENTS_DIR / "zone_enemies.json"
+    _ENV_ZONE_NAMES_FILE = ENVIRONMENTS_DIR / "zone_names.json"
+    _ENV_ZONE_UNLOCK_FILE = ENVIRONMENTS_DIR / "zone_unlock_requirements.json"
+    _ENV_ENEMY_STATS_FILE = ENVIRONMENTS_DIR / "enemy_stats.json"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    print("Data directory ready. Waiting for game server to push player_state.")
+    ENVIRONMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    print("Data directory ready. Waiting for game server to POST /game_config.")
 
     # Load model with vLLM backend
     from gpt_oss.vllm.token_generator import TokenGenerator as VLLMGenerator
