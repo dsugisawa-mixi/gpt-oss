@@ -75,10 +75,8 @@ CRITICAL RULE - READ FIRST:
 - Only introduce the game world if this is the very first message with no prior history.
 
 IMPORTANT:
-- All in-game narration, dialogue, and system messages MUST be in English.
-- The player ({player_name}) inputs in English.
+- {lang_instruction}
 - Your tone must always be warm, supportive, and nurturing, like a kind mother guiding her child.
-- NEVER use emojis, emoticons, or any non-ASCII characters. Use only plain ASCII text.
 - Do NOT use markdown formatting (no **, no ##, no bullet points). Use plain text only.
 
 # Core Role
@@ -194,6 +192,7 @@ sessions: dict[str, list[dict[str, str]]] = {}  # user_id -> full message list
 # Stored as-is (array, ordered by id DESC from DB)
 player_status_history: dict[str, list[dict]] = {}  # user_id -> [row, row, ...]
 nicknames: dict[str, str] = {}  # user_id -> nickname
+user_langs: dict[str, str] = {}  # user_id -> lang code (e.g. "ja", "en-US")
 unlocked_zones: dict[str, list[int]] = {}  # user_id -> [zone_id, ...]
 scenario_progress: dict[str, dict] = {}  # user_id -> {zone_id: {current, completed, current_step}}
 
@@ -467,6 +466,7 @@ class ChatRequest(BaseModel):
     user_id: str
     message: str
     nickname: Optional[str] = None
+    lang: Optional[str] = None  # e.g. "ja", "en-US"
     playerStatus: Optional[InlinePlayerStatus] = None
     unlocked_zones: Optional[list[int]] = None
     unlockedZones: Optional[list[int]] = None  # alias: JS sends camelCase
@@ -624,7 +624,32 @@ def build_prompt_messages(
       3. Last SHORT_TERM_WINDOW messages (short-term memory)
     """
     player_name = nicknames.get(user_id, "Adventurer")
-    system_content = SYSTEM_PROMPT.replace("{player_name}", player_name)
+    user_lang = user_langs.get(user_id, "en-US")
+
+    # Build language instruction based on user's lang setting
+    lang_code = user_lang.split("-")[0].lower()  # "ja", "en", etc.
+    if lang_code == "ja":
+        lang_instruction = (
+            "All in-game narration, dialogue, and system messages MUST be in Japanese (日本語). "
+            "The player ({player_name}) inputs in Japanese. "
+            "Respond entirely in Japanese. "
+            "NEVER use emojis or emoticons."
+        ).replace("{player_name}", player_name)
+    elif lang_code == "en":
+        lang_instruction = (
+            "All in-game narration, dialogue, and system messages MUST be in English. "
+            "The player ({player_name}) inputs in English. "
+            "NEVER use emojis, emoticons, or any non-ASCII characters. Use only plain ASCII text."
+        ).replace("{player_name}", player_name)
+    else:
+        lang_instruction = (
+            f"All in-game narration, dialogue, and system messages MUST be in the language with code '{user_lang}'. "
+            f"The player ({player_name}) inputs in that language. "
+            f"Respond entirely in that language. "
+            f"NEVER use emojis, emoticons, or any non-ASCII characters. Use only plain ASCII text."
+        ).replace("{player_name}", player_name)
+
+    system_content = SYSTEM_PROMPT.replace("{player_name}", player_name).replace("{lang_instruction}", lang_instruction)
 
     # Determine current player stats from available sources
     current_lv = 1
@@ -781,13 +806,15 @@ def _to_harmony_messages(prompt_messages: list[dict[str, str]]) -> list[Message]
 
 def generate_reply(
     prompt_messages: list[dict[str, str]],
-    max_new_tokens: int = 80,
-    max_reply_tokens: int = 20,
-) -> str:
+    max_new_tokens: int = 160,
+    max_reply_tokens: int = 80,
+) -> tuple[str, bool]:
     """
     Generate a reply.
     max_new_tokens: total budget including reasoning + final content.
     max_reply_tokens: hard cap on final-channel tokens (visible reply).
+    Returns (reply, was_truncated). was_truncated=True means the final channel
+    was cut off at max_reply_tokens rather than ending naturally via stop token.
     """
     t0 = time.perf_counter()
 
@@ -809,6 +836,7 @@ def generate_reply(
     gen_count = 0
     final_token_count = 0
     channels_seen: set[str] = set()
+    truncated = False
 
     for predicted_token in generator.generate(
         tokens, stop_tokens=stop_tokens, temperature=0.7, max_tokens=max_new_tokens
@@ -821,6 +849,7 @@ def generate_reply(
             reply_parts.append(parser.last_content_delta)
             final_token_count += 1
             if final_token_count >= max_reply_tokens:
+                truncated = True
                 break
 
     t2 = time.perf_counter()
@@ -832,13 +861,13 @@ def generate_reply(
     logger.info(
         "generate: input=%d tokens, output=%d tokens (final=%d), "
         "encode=%.1fms, generate=%.1fms (%.1f tok/s), total=%.1fms, "
-        "channels=%s, reply_len=%d",
+        "channels=%s, reply_len=%d, truncated=%s",
         len(tokens), gen_count, final_token_count,
         (t1 - t0) * 1000, gen_ms, tok_per_sec, (t2 - t0) * 1000,
-        channels_seen, len(reply),
+        channels_seen, len(reply), truncated,
     )
 
-    return reply
+    return reply, truncated
 
 
 # =====================================================================
@@ -983,6 +1012,10 @@ async def chat(req: ChatRequest):
     if req.nickname:
         nicknames[req.user_id] = req.nickname
 
+    # Store user language if provided
+    if req.lang:
+        user_langs[req.user_id] = req.lang
+
     # Store unlocked zones if provided (accept both snake_case and camelCase)
     uzones = req.unlocked_zones if req.unlocked_zones is not None else req.unlockedZones
     if uzones is not None:
@@ -1000,19 +1033,51 @@ async def chat(req: ChatRequest):
     # Build prompt: system + live game state + last 100 messages
     inline_status = req.playerStatus.model_dump() if req.playerStatus else None
     prompt_messages = build_prompt_messages(req.user_id, history, inline_status=inline_status)
-    reply = generate_reply(prompt_messages)
+    reply, truncated = generate_reply(prompt_messages)
 
-    # Strip non-latin1 characters (TTS downstream requires latin-1 safe output)
-    # Keep printable ASCII + common punctuation; replace CJK/emoji with space then collapse
+    # Sanitize reply. For English/other: strip to latin-1 (TTS constraint).
+    # For Japanese: TTS handles unicode, so keep CJK and strip only control chars.
     raw_reply = reply
-    reply = reply.encode("latin-1", errors="ignore").decode("latin-1")
-    reply = re.sub(r"[^\x20-\x7E\xa0-\xff]", " ", reply)
-    reply = re.sub(r" {2,}", " ", reply).strip()
+    req_lang_code = (req.lang or user_langs.get(req.user_id, "en-US")).split("-")[0].lower()
+    if req_lang_code == "ja":
+        reply = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", reply)
+        reply = re.sub(r"\s+", " ", reply).strip()
+    else:
+        reply = reply.encode("latin-1", errors="ignore").decode("latin-1")
+        reply = re.sub(r"[^\x20-\x7E\xa0-\xff]", " ", reply)
+        reply = re.sub(r" {2,}", " ", reply).strip()
+
+    # If truncated mid-generation, trim to the last sentence terminator so we
+    # don't save a mid-word fragment that the model would echo on the next turn
+    # (the original source of the "same nonsense reply" loop).
+    storable_reply = reply
+    if truncated and reply:
+        if req_lang_code == "ja":
+            # Japanese sanitizer keeps CJK, so look for full-width terminators.
+            # ASCII terminators are also included in case of mixed text.
+            terminators = "。！？.!?"
+        else:
+            # Non-ja was stripped to latin-1, so only ASCII terminators survive.
+            terminators = ".!?"
+        last_end = max((reply.rfind(c) for c in terminators), default=-1)
+        if last_end >= 0:
+            storable_reply = reply[: last_end + 1]
+            reply = storable_reply
+        else:
+            # No sentence boundary at all — the whole reply is a fragment.
+            # Show it to the user (so they aren't left blank) but do NOT save
+            # it to history, to prevent the echo loop on the next turn.
+            storable_reply = ""
+            logger.warning(
+                "generate: truncated reply with no sentence boundary for user=%s; "
+                "not saving to history. raw=%r",
+                req.user_id, raw_reply[:200],
+            )
 
     # Only store non-empty replies to avoid polluting history with blank assistant turns
-    if reply:
-        history.append({"role": "assistant", "content": reply})
-    else:
+    if storable_reply:
+        history.append({"role": "assistant", "content": storable_reply})
+    elif not reply:
         logger.warning(
             "generate: empty reply after latin-1 strip for user=%s. "
             "Raw reply (%d chars): %r",
