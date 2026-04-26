@@ -2,12 +2,17 @@ from vllm import LLMEngine, EngineArgs, SamplingParams, TokensPrompt
 
 
 class TokenGenerator:
-    def __init__(self, model_path: str, tensor_parallel_size: int = 1):
+    def __init__(
+        self,
+        model_path: str,
+        tensor_parallel_size: int = 1,
+        max_model_len: int = 16384,
+    ):
         args = EngineArgs(
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=0.6,
-            max_model_len=4096,
+            max_model_len=max_model_len,
             max_num_seqs=1,
             enforce_eager=True,
             kv_cache_dtype="fp8",

@@ -1513,8 +1513,8 @@ def main():
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--data-dir", default="nanny_data", help="Directory for persistent data")
-    parser.add_argument("--context-length", type=int, default=8192,
-                        help="Max context length for KV cache (triton backend)")
+    parser.add_argument("--context-length", type=int, default=16384,
+                        help="Max model context length passed to the vLLM engine")
     args = parser.parse_args()
 
     # Set up data directories
@@ -1537,8 +1537,12 @@ def main():
     # Load model with vLLM backend
     from gpt_oss.vllm.token_generator import TokenGenerator as VLLMGenerator
 
-    print(f"Loading model: {args.checkpoint} (vLLM backend) ...")
-    generator = VLLMGenerator(args.checkpoint, tensor_parallel_size=1)
+    print(f"Loading model: {args.checkpoint} (vLLM backend, max_model_len={args.context_length}) ...")
+    generator = VLLMGenerator(
+        args.checkpoint,
+        tensor_parallel_size=1,
+        max_model_len=args.context_length,
+    )
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     print("Model loaded with vLLM backend.")
 
