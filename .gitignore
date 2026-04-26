@@ -5,3 +5,5 @@ __pycache__
 *.egg*
 node_modules/
 *.log
+nanny_data/
+venv312/
