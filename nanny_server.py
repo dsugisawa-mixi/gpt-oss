@@ -1,13 +1,18 @@
 """
-HTTP server for chatting with the Nanny RPG Game Master using gpt-oss-20b.
+HTTP server for the scenario-based Education RPG, powered by gpt-oss-20b.
+
+The LLM acts as the player's domain-expert assistant + Game Master. The active
+scenario (persona) is chosen per request via scenario_id and defines who the
+assistant IS (e.g. mobile-core-network senior engineer). Common RPG mechanics
+(zones, enemies, combat, EXP) stay in code.
 
 Usage:
     python nanny_server.py [--checkpoint openai/gpt-oss-20b] [--port 8080]
 
 Endpoints:
     GET  /              — Simple web UI
-    POST /chat          — JSON API: {"user_id": "...", "message": "..."} -> {"reply": "..."}
-    POST /game_config   — Game server pushes zones + zone_enemies tables at startup
+    POST /chat          — JSON API: {"user_id": "...", "message": "...", "scenario_id": "..."} -> {"reply": "..."}
+    POST /game_config   — Game server pushes zones + scenarios at startup
     POST /game_state    — Game server pushes player state (from DB) on events
     POST /reset         — Reset conversation history
     GET  /game_state    — View current player state
@@ -17,6 +22,7 @@ Memory system:
     - Short-term: Last 100 messages (user+assistant turns) kept in prompt context
     - Long-term:  Game server POSTs player_state from MySQL on each event/command
     - Sessions:   Full conversation history saved to disk per user_id
+    - Scenarios:  Persona definitions persisted to nanny_data/scenarios/<id>.json
 """
 
 import argparse
@@ -64,10 +70,18 @@ logging.basicConfig(
 SHORT_TERM_WINDOW = 100  # max recent messages in prompt
 DATA_DIR = Path("nanny_data")
 SESSIONS_DIR = DATA_DIR / "sessions"
+SCENARIOS_DIR = DATA_DIR / "scenarios"
+
+# Default scenario used when /chat does not specify scenario_id and the user
+# has no prior selection. The gameserver pushes scenario definitions via
+# /game_config; this id should match one of the pushed scenarios.
+DEFAULT_SCENARIO_ID = "mobile-core-network-senior-engineer"
 
 SYSTEM_PROMPT = """\
-You are a gentle, caring mother and nanny for an 11-year-old boy named {player_name}.
-At the same time, you are the Game Master (GM) of a beginner-friendly tabletop RPG.
+# Your Persona (scenario: {scenario_name})
+{scenario_persona}
+
+You are also the Game Master (GM) of an Education RPG that the player {player_name} is playing.
 
 CRITICAL RULE - READ FIRST:
 - You MUST continue from where the conversation left off. Read the previous messages carefully and respond to what {player_name} just said.
@@ -76,23 +90,18 @@ CRITICAL RULE - READ FIRST:
 
 IMPORTANT:
 - {lang_instruction}
-- Your tone must always be warm, supportive, and nurturing, like a kind mother guiding her child.
+- Stay in character as defined by your Persona above.
 - Do NOT use markdown formatting (no **, no ##, no bullet points). Use plain text only.
 
 # Core Role
 You must simultaneously:
 1. Act as a Game Master narrating a fantasy adventure
-2. Act as a loving mother/nanny supporting and encouraging {player_name}
-3. Keep the game simple and beginner-friendly
-4. Guide the player gently when they are unsure
+2. Act as the player's assistant per the Persona defined above
+3. Answer the player's domain questions accurately within your persona's expertise
+4. Guide the player when they are unsure
 
-# Tone Rules
-- Warm, kind, encouraging
-- Simple English suitable for a child
-- Never harsh, never cold
-- Slight emotional support is encouraged (e.g., "That's a lovely idea, {player_name}.")
-- MAXIMUM 10 words per response. Be extremely brief.
-- Do NOT end your response with a question. Just narrate what happens.
+# Response Format Rules
+{scenario_response_rules}
 
 # ABSOLUTE RULE — NO INVENTION
 You are FORBIDDEN from generating any game content on your own.
@@ -115,7 +124,7 @@ Zones: see "Zone Progress" section below for the full list.
 
 # Game Objective
 {player_name} will explore, fight monsters, earn gold, buy equipment, level up, and collect rare "Monster Stones".
-Final goal: Collect Monster Stones and give them to you (the nanny/GM).
+Final goal: Collect Monster Stones and give them to you (the assistant/GM).
 
 # Starting Stats (only use these if no Live Game State is provided below and no prior conversation exists)
 Level: 1 | HP: 10/10 | MP: 5/5 | Attack: 3 | Defense: 1
@@ -129,9 +138,9 @@ Gold: 0 | Monster Stones: 0 | EXP: 0
 - F button = PUNCH (not kick). F is always punch.
 - Do NOT confuse these. A=kick, F=punch. Never swap them.
 - The player does NOT have weapons, sticks, potions, or any items at the start. Do NOT mention items the player does not have.
-## Magic - The player can say "Cure" to restore HP (costs 1 MP). If HP drops below 30%, gently remind {player_name} to say "Cure".
-## Death - If HP is 0, the player is dead. Gently remind {player_name} to say "Revive" to come back to life.
-## Progression - Gain EXP + Gold from monsters. Level up increases stats. Celebrate level-ups warmly.
+## Magic - The player can say "Cure" to restore HP (costs 1 MP). If HP drops below 30%, remind {player_name} to say "Cure".
+## Death - If HP is 0, the player is dead. Remind {player_name} to say "Revive" to come back to life.
+## Progression - Gain EXP + Gold from monsters. Level up increases stats. Acknowledge level-ups in your persona's voice.
 ## Monsters - No scary descriptions. Do NOT invent colors or appearances not listed here.
 - Slime: blue, round, similar to Dragon Quest 1 slime. NOT green. Weakest and slowest. Short melee range.
 - Ramia: a small bird-like creature. Fast (speed 1.5), long attack range (4.0), wide aggro (20.0). Hard to escape once spotted.
@@ -147,9 +156,9 @@ Encourage small discoveries, NPC conversations, shops, simple quests, hidden ite
 NPC examples: Gant (weapon shop), Mira (inn), Popo (item shop grandma), Tim (young adventurer)
 
 # Conversation Style
-- Talk naturally, like a warm conversation between a caring mother and her child.
+- Talk naturally with the player, in the voice and tone defined by your Persona.
 - Do NOT present numbered lists of choices or options (no "1. ... 2. ... 3. ...").
-- Instead, describe the scene and gently suggest what {player_name} might do next in natural sentences.
+- Instead, describe the scene and suggest what {player_name} might do next in natural sentences.
 - Keep responses conversational and flowing, not structured like a menu.
 
 # Safety Rules
@@ -195,21 +204,28 @@ nicknames: dict[str, str] = {}  # user_id -> nickname
 user_langs: dict[str, str] = {}  # user_id -> lang code (e.g. "ja", "en-US")
 unlocked_zones: dict[str, list[int]] = {}  # user_id -> [zone_id, ...]
 scenario_progress: dict[str, dict] = {}  # user_id -> {zone_id: {current, completed, current_step}}
+user_scenarios: dict[str, str] = {}  # user_id -> scenario_id (top-level assistant persona)
 
 
 def _get_current_scenario_voice(user_id: str) -> str:
-    """Return the voice/gender from the active (non-completed) scenario step, or 'female' as default."""
+    """Return the voice/gender from the active zone-script step.
+    Falls back to the user's top-level scenario default_voice, then 'female'."""
+    # Compute the top-level scenario default first so it acts as the fallback.
+    sid = user_scenarios.get(user_id) or DEFAULT_SCENARIO_ID
+    scenario = _load_scenario_or_fallback(sid)
+    fallback_voice = (scenario or {}).get("default_voice") or "female"
+
     progress = scenario_progress.get(user_id)
     if not progress:
-        return "female"
+        return fallback_voice
     # Find the first non-completed zone's current_step
     for _zone_id, zone_info in progress.items():
         if zone_info.get("completed"):
             continue
         step = zone_info.get("current_step")
         if step:
-            return step.get("voice", "female")
-    return "female"
+            return step.get("voice", fallback_voice)
+    return fallback_voice
 
 
 # EXP table (cumulative EXP required for each level)
@@ -227,7 +243,6 @@ ENVIRONMENTS_DIR = DATA_DIR / "environments"
 
 # File paths for each config component
 _ENV_ZONES_FILE = ENVIRONMENTS_DIR / "zones.json"
-_ENV_ZONE_ENEMIES_FILE = ENVIRONMENTS_DIR / "zone_enemies.json"
 _ENV_ZONE_NAMES_FILE = ENVIRONMENTS_DIR / "zone_names.json"
 _ENV_ZONE_UNLOCK_FILE = ENVIRONMENTS_DIR / "zone_unlock_requirements.json"
 _ENV_ENEMY_STATS_FILE = ENVIRONMENTS_DIR / "enemy_stats.json"
@@ -261,7 +276,7 @@ def _flock_read_json(path: Path, default=None):
 
 def _game_config_ready() -> bool:
     """Check if game config has been set up (files exist)."""
-    return _ENV_ZONES_FILE.exists() and _ENV_ZONE_ENEMIES_FILE.exists()
+    return _ENV_ZONES_FILE.exists()
 
 
 def _load_zone_names() -> dict[int, str]:
@@ -278,10 +293,38 @@ def _load_enemy_stats() -> dict[str, dict]:
     return _flock_read_json(_ENV_ENEMY_STATS_FILE, {})
 
 
-def _load_zone_enemies() -> dict[int, list[list]]:
-    """Returns {zone_id: [[enemy_type, player_lv, count], ...]}."""
-    raw = _flock_read_json(_ENV_ZONE_ENEMIES_FILE, {})
-    return {int(k): v for k, v in raw.items()}
+def _scenario_path(scenario_id: str) -> Path:
+    return SCENARIOS_DIR / f"{scenario_id}.json"
+
+
+def _save_scenario(scenario: dict) -> None:
+    """Persist a single scenario definition to nanny_data/scenarios/<id>.json."""
+    sid = scenario.get("scenario_id")
+    if not sid:
+        raise ValueError("scenario must have scenario_id")
+    _flock_write_json(_scenario_path(sid), scenario)
+
+
+def _load_scenario(scenario_id: str) -> Optional[dict]:
+    """Load a scenario by id from disk; returns None if not found."""
+    return _flock_read_json(_scenario_path(scenario_id), None)
+
+
+def _load_scenario_or_fallback(scenario_id: Optional[str]) -> Optional[dict]:
+    """Load requested scenario; if missing, fall back to DEFAULT_SCENARIO_ID,
+    then to the first scenario file found. Returns None if no scenarios exist."""
+    if scenario_id:
+        sc = _load_scenario(scenario_id)
+        if sc:
+            return sc
+        logger.warning("scenario %s not found; falling back to default", scenario_id)
+    sc = _load_scenario(DEFAULT_SCENARIO_ID)
+    if sc:
+        return sc
+    if SCENARIOS_DIR.exists():
+        for p in sorted(SCENARIOS_DIR.glob("*.json")):
+            return _flock_read_json(p, None)
+    return None
 
 
 def _format_zone_enemies(zone_id: int, player_attack: int = 3, player_defense: int = 1) -> str:
@@ -396,53 +439,69 @@ def _format_scenario_context(user_id: str, zone_id: int) -> str:
     return "\n".join(lines)
 
 
-def _format_zone_progress(unlocked_zones: list[int], current_lv: int, current_exp: int, current_gold: int = 0) -> str:
-    """Format zone unlock progress and next goal for the system prompt."""
+def _format_zone_progress(user_id: str, unlocked: list[int]) -> str:
+    """Format zone unlock progress and next goal for the system prompt.
+
+    Unlock eligibility is decided by the game server (scenario completion +
+    POI visits). Here we just reflect the resulting state and show scenario
+    step progress per unlocked zone, plus a Next Goal pointing at the
+    latest unlocked zone's scenario completion.
+    """
     zone_names = _load_zone_names()
-    zone_unlock = _load_zone_unlock_requirements()
-    unlocked_set = set(unlocked_zones)
+    zones = _flock_read_json(_ENV_ZONES_FILE, [])
+    zone_by_id = {z.get("zone_id"): z for z in zones if z.get("zone_id") is not None}
+    progress = scenario_progress.get(user_id, {}) or {}
+    unlocked_set = set(unlocked)
+
+    def _step_position(zid: int) -> tuple[int, int, bool]:
+        """Return (current_idx_1based, total, completed) for a zone's scenario."""
+        steps = (zone_by_id.get(zid, {}) or {}).get("scenarios") or []
+        zp = progress.get(str(zid), {}) or {}
+        is_completed = bool(zp.get("completed"))
+        total = len(steps)
+        current_step_id = zp.get("current")
+        idx = 0
+        if current_step_id and steps:
+            for i, s in enumerate(steps):
+                if s.get("id") == current_step_id or s.get("step_id") == current_step_id:
+                    idx = i
+                    break
+        return (idx + 1 if total else 0, total, is_completed)
+
     lines = ["\n## Zone Progress"]
+    next_locked: Optional[tuple[int, str]] = None
 
-    # Show unlocked zones
-    for zid in sorted(unlocked_set):
-        name = zone_names.get(zid, f"Zone {zid}")
-        lines.append(f"  {name} (zone {zid}): UNLOCKED")
-
-    # Show locked zones with requirements and progress
-    next_goal = None
     for zid in sorted(zone_names.keys()):
-        if zid in unlocked_set:
-            continue
         name = zone_names.get(zid, f"Zone {zid}")
-        req = zone_unlock.get(zid)
-        if req:
-            min_lv = req["min_lv"]
-            min_gold = req.get("min_gold", 0)
-            lv_met = current_lv >= min_lv
-            gold_met = current_gold >= min_gold
-            if lv_met and gold_met:
-                lines.append(f"  {name} (zone {zid}): LOCKED (requirements met! Lv{current_lv} >= Lv{min_lv}, Gold{current_gold} >= {min_gold}) -- may need a trigger event")
+        if zid in unlocked_set:
+            cur_pos, total, is_completed = _step_position(zid)
+            if is_completed:
+                lines.append(f"  {name} (zone {zid}): UNLOCKED — scenario complete")
+            elif total:
+                lines.append(f"  {name} (zone {zid}): UNLOCKED — scenario step {cur_pos}/{total}")
             else:
-                parts = []
-                if not lv_met:
-                    lvs_needed = min_lv - current_lv
-                    if min_lv < len(EXP_TABLE):
-                        exp_needed = max(0, EXP_TABLE[min_lv] - current_exp)
-                    else:
-                        exp_needed = 0
-                    parts.append(f"Lv{min_lv} ({lvs_needed} more levels, {exp_needed} more EXP)")
-                if not gold_met:
-                    gold_needed = min_gold - current_gold
-                    parts.append(f"{min_gold} Gold ({gold_needed} more Gold)")
-                lines.append(f"  {name} (zone {zid}): LOCKED -- need {' and '.join(parts)}")
-                if next_goal is None:
-                    next_goal = f"Reach Lv{min_lv} and {min_gold} Gold to unlock {name}. Need: {', '.join(parts)}."
+                lines.append(f"  {name} (zone {zid}): UNLOCKED")
         else:
-            lines.append(f"  {name} (zone {zid}): LOCKED")
+            lines.append(f"  {name} (zone {zid}): LOCKED — unlocks after completing the previous zone's scenario")
+            if next_locked is None:
+                next_locked = (zid, name)
 
-    if next_goal:
-        lines.append(f"\n## Next Goal\n{next_goal}")
-        lines.append("Encourage the player to keep fighting monsters and gaining EXP and Gold toward this goal.")
+    if next_locked is not None and unlocked_set:
+        focus_zid = max(unlocked_set)
+        focus_name = zone_names.get(focus_zid, f"Zone {focus_zid}")
+        cur_pos, total, is_completed = _step_position(focus_zid)
+        _, next_name = next_locked
+        if is_completed:
+            lines.append(f"\n## Next Goal\n{focus_name} scenario is complete — entering {next_name} should unlock it.")
+        elif total:
+            remaining = max(0, total - cur_pos)
+            lines.append(
+                f"\n## Next Goal\nComplete {focus_name}'s scenario "
+                f"({remaining} steps remaining, currently at {cur_pos}/{total}) to unlock {next_name}."
+            )
+        else:
+            lines.append(f"\n## Next Goal\nComplete {focus_name}'s scenario to unlock {next_name}.")
+        lines.append("Encourage the player toward finishing the current scenario.")
 
     return "\n".join(lines)
 
@@ -470,6 +529,8 @@ class ChatRequest(BaseModel):
     playerStatus: Optional[InlinePlayerStatus] = None
     unlocked_zones: Optional[list[int]] = None
     unlockedZones: Optional[list[int]] = None  # alias: JS sends camelCase
+    scenario_id: Optional[str] = None  # top-level assistant persona; falls back to DEFAULT_SCENARIO_ID
+    scenarioId: Optional[str] = None   # alias: JS sends camelCase
 
 
 class ChatResponse(BaseModel):
@@ -489,20 +550,28 @@ class ZoneRow(BaseModel):
     scenarios: Optional[list] = None         # scenario steps for this zone
 
 
-class ZoneEnemyRow(BaseModel):
-    """Row from MySQL zone_enemies table."""
-    id: Optional[int] = None
-    zone_id: int
-    enemy_type: str
-    player_lv: int = 1
-    count: int = 1
-    spawn_points: Optional[str] = None
+class ScenarioRow(BaseModel):
+    """Top-level scenario / assistant persona pushed by the game server.
+
+    Each scenario defines who the LLM IS for that learning track
+    (e.g. mobile-core-network senior engineer). The persona_prompt is
+    injected into the system prompt; common RPG mechanics stay in code.
+
+    response_rules controls how the assistant formats replies (length cap,
+    ending tone, etc.). If omitted, a sensible default is used.
+    """
+    scenario_id: str
+    name: str
+    persona_prompt: str
+    response_rules: Optional[str] = None  # bullet-list text injected into "Response Format Rules"
+    default_voice: Optional[str] = "female"  # TTS voice fallback
+    description: Optional[str] = None
 
 
 class GameConfigRequest(BaseModel):
-    """Game server pushes zone + zone_enemies tables at startup."""
+    """Game server pushes zones + scenarios at startup."""
     zones: list[ZoneRow]
-    zone_enemies: list[ZoneEnemyRow]
+    scenarios: Optional[list[ScenarioRow]] = None
 
 
 class PlayerStatusRow(BaseModel):
@@ -649,7 +718,35 @@ def build_prompt_messages(
             f"NEVER use emojis, emoticons, or any non-ASCII characters. Use only plain ASCII text."
         ).replace("{player_name}", player_name)
 
-    system_content = SYSTEM_PROMPT.replace("{player_name}", player_name).replace("{lang_instruction}", lang_instruction)
+    # Resolve scenario persona (top-level assistant identity)
+    sid = user_scenarios.get(user_id) or DEFAULT_SCENARIO_ID
+    scenario = _load_scenario_or_fallback(sid)
+    default_response_rules = (
+        "- MAXIMUM 10 words per response. Be extremely brief.\n"
+        "- Do NOT end your response with a question. Just narrate what happens."
+    )
+    if scenario:
+        scenario_name = scenario.get("name", scenario.get("scenario_id", sid))
+        scenario_persona = scenario.get("persona_prompt", "")
+        scenario_response_rules = scenario.get("response_rules") or default_response_rules
+    else:
+        # No scenarios pushed yet — use a minimal placeholder so prompt still renders.
+        # Game server should POST /game_config with scenarios at startup.
+        scenario_name = sid
+        scenario_persona = "You are the player's assistant in this RPG."
+        scenario_response_rules = default_response_rules
+        logger.warning("no scenario found for user=%s sid=%s; using placeholder persona", user_id, sid)
+
+    # Substitute scenario fields first so any {player_name} / {lang_instruction}
+    # references inside persona_prompt or response_rules are resolved by the later replacements.
+    system_content = (
+        SYSTEM_PROMPT
+        .replace("{scenario_name}", scenario_name)
+        .replace("{scenario_persona}", scenario_persona)
+        .replace("{scenario_response_rules}", scenario_response_rules)
+        .replace("{player_name}", player_name)
+        .replace("{lang_instruction}", lang_instruction)
+    )
 
     # Determine current player stats from available sources
     current_lv = 1
@@ -686,15 +783,7 @@ EXP: {inline_status['exp']} | Gold: {inline_status['gold']}
 
     # Inject zone progress and next goal
     user_unlocked = unlocked_zones.get(user_id, [1])  # default: only zone 1
-    current_exp = 0
-    current_gold = 0
-    if inline_status:
-        current_exp = inline_status.get("exp", 0)
-        current_gold = inline_status.get("gold", 0)
-    elif rows:
-        current_exp = rows[0].get("exp", 0)
-        current_gold = rows[0].get("gold", 0)
-    system_content += _format_zone_progress(user_unlocked, current_lv, current_exp, current_gold)
+    system_content += _format_zone_progress(user_id, user_unlocked)
     system_content += _format_scenario_context(user_id, zone_id)
 
     messages = [{"role": "system", "content": system_content}]
@@ -877,9 +966,9 @@ def generate_reply(
 @app.post("/game_config")
 async def receive_game_config(cfg: GameConfigRequest):
     """
-    Game server pushes zones + zone_enemies tables at startup.
-    Persists to nanny_data/environments/ as JSON files with flock.
-    All consumers read from these files on each request.
+    Game server pushes zones + scenarios at startup.
+    Persists to nanny_data/environments/ and nanny_data/scenarios/ as JSON
+    files with flock. All consumers read from these files on each request.
     """
     # --- Build derived dicts from zones rows ---
     new_zone_names: dict[int, str] = {}
@@ -916,27 +1005,27 @@ async def receive_game_config(cfg: GameConfigRequest):
             elif cond:
                 new_zone_unlock[z.zone_id] = {"min_lv": 0, "min_gold": 0, "unlock_condition": cond}
 
-    # --- Build zone_enemies dict ---
-    new_zone_enemies: dict[int, list[list]] = {}
-    for ze in cfg.zone_enemies:
-        new_zone_enemies.setdefault(ze.zone_id, []).append(
-            [ze.enemy_type, ze.player_lv, ze.count]
-        )
-
     # --- Persist all to JSON files with flock ---
     _flock_write_json(_ENV_ZONES_FILE, raw_zones)
     _flock_write_json(_ENV_ZONE_NAMES_FILE, new_zone_names)
     _flock_write_json(_ENV_ZONE_UNLOCK_FILE, new_zone_unlock)
-    _flock_write_json(_ENV_ZONE_ENEMIES_FILE, new_zone_enemies)
+
+    # --- Persist scenarios (one file per scenario_id) ---
+    scenario_ids: list[str] = []
+    if cfg.scenarios:
+        SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
+        for sc in cfg.scenarios:
+            _save_scenario(sc.model_dump())
+            scenario_ids.append(sc.scenario_id)
 
     logger.info(
-        "game_config: loaded %d zones, %d zone_enemy entries. ZONE_NAMES=%s",
-        len(cfg.zones), len(cfg.zone_enemies), new_zone_names,
+        "game_config: loaded %d zones, %d scenarios. ZONE_NAMES=%s SCENARIOS=%s",
+        len(cfg.zones), len(scenario_ids), new_zone_names, scenario_ids,
     )
     return {
         "status": "ok",
         "zones": len(cfg.zones),
-        "zone_enemies": len(cfg.zone_enemies),
+        "scenarios": scenario_ids,
         "zone_names": new_zone_names,
     }
 
@@ -1020,6 +1109,11 @@ async def chat(req: ChatRequest):
     uzones = req.unlocked_zones if req.unlocked_zones is not None else req.unlockedZones
     if uzones is not None:
         unlocked_zones[req.user_id] = uzones
+
+    # Store scenario selection if provided (accept both snake_case and camelCase)
+    sid = req.scenario_id if req.scenario_id is not None else req.scenarioId
+    if sid:
+        user_scenarios[req.user_id] = sid
 
     history = get_or_create_session(req.user_id)
 
@@ -1248,19 +1342,20 @@ def main():
     args = parser.parse_args()
 
     # Set up data directories
-    global DATA_DIR, SESSIONS_DIR, ENVIRONMENTS_DIR
-    global _ENV_ZONES_FILE, _ENV_ZONE_ENEMIES_FILE, _ENV_ZONE_NAMES_FILE, _ENV_ZONE_UNLOCK_FILE, _ENV_ENEMY_STATS_FILE
+    global DATA_DIR, SESSIONS_DIR, ENVIRONMENTS_DIR, SCENARIOS_DIR
+    global _ENV_ZONES_FILE, _ENV_ZONE_NAMES_FILE, _ENV_ZONE_UNLOCK_FILE, _ENV_ENEMY_STATS_FILE
     DATA_DIR = Path(args.data_dir)
     SESSIONS_DIR = DATA_DIR / "sessions"
     ENVIRONMENTS_DIR = DATA_DIR / "environments"
+    SCENARIOS_DIR = DATA_DIR / "scenarios"
     _ENV_ZONES_FILE = ENVIRONMENTS_DIR / "zones.json"
-    _ENV_ZONE_ENEMIES_FILE = ENVIRONMENTS_DIR / "zone_enemies.json"
     _ENV_ZONE_NAMES_FILE = ENVIRONMENTS_DIR / "zone_names.json"
     _ENV_ZONE_UNLOCK_FILE = ENVIRONMENTS_DIR / "zone_unlock_requirements.json"
     _ENV_ENEMY_STATS_FILE = ENVIRONMENTS_DIR / "enemy_stats.json"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     ENVIRONMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
     print("Data directory ready. Waiting for game server to POST /game_config.")
 
     # Load model with vLLM backend
