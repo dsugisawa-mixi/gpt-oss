@@ -47,6 +47,7 @@ from pydantic import BaseModel
 import uvicorn
 
 from openai_harmony import (
+    Author,
     Conversation,
     DeveloperContent,
     HarmonyEncodingName,
@@ -56,6 +57,7 @@ from openai_harmony import (
     StreamableParser,
     StreamState,
     SystemContent,
+    ToolDescription,
     load_harmony_encoding,
 )
 
@@ -102,6 +104,14 @@ You must simultaneously:
 
 # Response Format Rules
 {scenario_response_rules}
+
+# Tool Calls
+- The developer message lists callable functions under "namespace functions".
+- When you need fresh data from the game server (player state, scenario progress, etc.), emit a tool call in the commentary channel to the matching `functions.<name>`.
+- Tool call JSON arguments are EXEMPT from the response length cap and plain-text rules above; emit valid JSON exactly as required by the tool schema.
+- Do NOT mention tool calls in the final channel and do NOT narrate them to the player. The player only sees the final channel.
+- After receiving a tool result (role=tool), produce the player-facing reply in the final channel, obeying the response format rules.
+- If no tool is needed, answer directly in final.
 
 # ABSOLUTE RULE — NO INVENTION
 You are FORBIDDEN from generating any game content on your own.
@@ -174,9 +184,22 @@ logger = logging.getLogger("nanny")
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(request: Request, exc: RequestValidationError):
-    logger.error("Validation error on %s %s: %s", request.method, request.url.path, exc.errors())
+    # exc.errors() may include `input` as bytes when the body fails to parse
+    # (e.g. wrong Content-Type). Sanitize before JSON-encoding so we don't 500
+    # the error handler itself.
+    raw_errors = exc.errors()
+    safe_errors = []
+    for e in raw_errors:
+        e = dict(e)
+        if isinstance(e.get("input"), (bytes, bytearray)):
+            try:
+                e["input"] = bytes(e["input"]).decode("utf-8", errors="replace")
+            except Exception:
+                e["input"] = repr(e["input"])
+        safe_errors.append(e)
+    logger.error("Validation error on %s %s: %s", request.method, request.url.path, safe_errors)
     logger.error("Request body: %s", exc.body)
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 
 @app.middleware("http")
@@ -205,6 +228,51 @@ user_langs: dict[str, str] = {}  # user_id -> lang code (e.g. "ja", "en-US")
 unlocked_zones: dict[str, list[int]] = {}  # user_id -> [zone_id, ...]
 scenario_progress: dict[str, dict] = {}  # user_id -> {zone_id: {current, completed, current_step}}
 user_scenarios: dict[str, str] = {}  # user_id -> scenario_id (top-level assistant persona)
+
+
+# =====================================================================
+# Tools  (Harmony function calling — exposed to the model via developer msg)
+# =====================================================================
+
+_EMPTY_PARAMS = {"type": "object", "properties": {}}
+
+TOOL_DESCRIPTIONS = [
+    ToolDescription.new(
+        "get_game_state",
+        "Get the current player's live game state and recent status history "
+        "(HP, MP, level, gold, location). No arguments — operates on the current chat user.",
+        parameters=_EMPTY_PARAMS,
+    ),
+    ToolDescription.new(
+        "get_scenario_progress",
+        "Get the current player's per-zone scenario progress (current step, completed flag). "
+        "No arguments — operates on the current chat user.",
+        parameters=_EMPTY_PARAMS,
+    ),
+    ToolDescription.new(
+        "reset_session",
+        "Wipe the current player's conversation session history. "
+        "No arguments. Use only when the player explicitly asks to start over.",
+        parameters=_EMPTY_PARAMS,
+    ),
+]
+
+
+def run_function_tool(name: str, args: dict, *, user_id: str) -> dict:
+    """Dispatch a Harmony function tool call.
+    `user_id` is taken from the /chat request context, never from the model.
+    `args` is accepted but ignored (kept for forward compatibility)."""
+    if name == "get_game_state":
+        return {"user_id": user_id, "rows": player_status_history.get(user_id, [])}
+    if name == "get_scenario_progress":
+        return {"user_id": user_id, "progress": scenario_progress.get(user_id, {})}
+    if name == "reset_session":
+        sessions.pop(user_id, None)
+        path = _session_path(user_id)
+        if path.exists():
+            path.unlink()
+        return {"status": "reset", "user_id": user_id}
+    return {"error": f"unknown tool: {name}"}
 
 
 def _get_current_scenario_voice(user_id: str) -> str:
@@ -850,30 +918,43 @@ EXP: {inline_status['exp']} | Gold: {inline_status['gold']}
 # Generation
 # =====================================================================
 
-def _to_harmony_messages(prompt_messages: list[dict[str, str]]) -> list[Message]:
-    """Convert simple role/content dicts to Harmony Message objects."""
+def _to_harmony_messages(prompt_messages: list[dict]) -> list[Message]:
+    """Convert simple role/content dicts to Harmony Message objects.
+
+    Supported dict shapes:
+      {"role": "system",    "content": str}
+      {"role": "user",      "content": str}
+      {"role": "assistant", "content": str, "channel"?: str, "recipient"?: str}
+      {"role": "tool",      "name": str,    "content": str}   # tool result
+    """
     harmony_msgs: list[Message] = []
     first_system = True
 
     for msg in prompt_messages:
-        role, content = msg["role"], msg["content"]
+        role = msg["role"]
+        content = msg.get("content", "")
 
         if role == "system":
             if first_system:
                 first_system = False
-                # Model-level system message (identity, reasoning config)
+                # Model-level system message (identity, reasoning, channel policy)
                 sys_content = (
                     SystemContent.new()
                     .with_reasoning_effort(ReasoningEffort.LOW)
                     .with_conversation_start_date(
                         datetime.datetime.now().strftime("%Y-%m-%d")
                     )
+                    .with_required_channels(["analysis", "commentary", "final"])
                 )
                 harmony_msgs.append(
                     Message.from_role_and_content(Role.SYSTEM, sys_content)
                 )
-                # Custom instructions as developer message
-                dev_content = DeveloperContent.new().with_instructions(content)
+                # Custom instructions + tools as developer message
+                dev_content = (
+                    DeveloperContent.new()
+                    .with_instructions(content)
+                    .with_function_tools(TOOL_DESCRIPTIONS)
+                )
                 harmony_msgs.append(
                     Message.from_role_and_content(Role.DEVELOPER, dev_content)
                 )
@@ -886,45 +967,61 @@ def _to_harmony_messages(prompt_messages: list[dict[str, str]]) -> list[Message]
         elif role == "user":
             harmony_msgs.append(Message.from_role_and_content(Role.USER, content))
         elif role == "assistant":
-            harmony_msgs.append(
-                Message.from_role_and_content(Role.ASSISTANT, content)
+            m = Message.from_role_and_content(Role.ASSISTANT, content)
+            ch = msg.get("channel", "final")
+            m = m.with_channel(ch)
+            rcpt = msg.get("recipient")
+            if rcpt:
+                m = m.with_recipient(rcpt)
+            harmony_msgs.append(m)
+        elif role == "tool":
+            tool_name = msg.get("name", "unknown")
+            m = (
+                Message.from_author_and_content(
+                    Author.new(Role.TOOL, f"functions.{tool_name}"),
+                    content,
+                )
+                .with_channel("commentary")
+                .with_recipient("assistant")
             )
+            harmony_msgs.append(m)
 
     return harmony_msgs
 
 
-def generate_reply(
-    prompt_messages: list[dict[str, str]],
-    max_new_tokens: int = 160,
+def generate_once(
+    prompt_messages: list[dict],
+    max_new_tokens: int = 256,
     max_reply_tokens: int = 80,
-) -> tuple[str, bool]:
+) -> dict:
     """
-    Generate a reply.
-    max_new_tokens: total budget including reasoning + final content.
-    max_reply_tokens: hard cap on final-channel tokens (visible reply).
-    Returns (reply, was_truncated). was_truncated=True means the final channel
-    was cut off at max_reply_tokens rather than ending naturally via stop token.
+    Run one forward pass and return either a final reply or a tool call.
+
+    Returns one of:
+      {"type": "final",     "reply": str, "truncated": bool}
+      {"type": "tool_call", "recipient": str, "arguments": str}
+
+    `recipient` is the full Harmony name like "functions.get_game_state".
     """
     t0 = time.perf_counter()
 
-    # Encode conversation with Harmony protocol
     harmony_msgs = _to_harmony_messages(prompt_messages)
     conversation = Conversation.from_messages(harmony_msgs)
     tokens = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
     stop_tokens = encoding.stop_tokens_for_assistant_actions()
 
-    # Debug: dump decoded prompt to verify history is included
     decoded_prompt = encoding.decode(tokens)
     logger.info("=== PROMPT DUMP (last 500 chars) ===\n%s", decoded_prompt[-500:])
 
     t1 = time.perf_counter()
 
-    # Generate via vLLM backend
     parser = StreamableParser(encoding, role=Role.ASSISTANT)
-    reply_parts: list[str] = []
+    final_parts: list[str] = []
+    tool_parts: list[str] = []
+    last_tool_recipient: Optional[str] = None
+    channels_seen: set[str] = set()
     gen_count = 0
     final_token_count = 0
-    channels_seen: set[str] = set()
     truncated = False
 
     for predicted_token in generator.generate(
@@ -932,31 +1029,110 @@ def generate_reply(
     ):
         parser.process(predicted_token)
         gen_count += 1
-        if parser.current_channel:
-            channels_seen.add(parser.current_channel)
-        if parser.last_content_delta and parser.current_channel == "final":
-            reply_parts.append(parser.last_content_delta)
+        ch = parser.current_channel
+        if ch:
+            channels_seen.add(ch)
+        delta = parser.last_content_delta
+        if not delta:
+            continue
+        if ch == "final":
+            final_parts.append(delta)
             final_token_count += 1
             if final_token_count >= max_reply_tokens:
                 truncated = True
                 break
+        elif ch == "commentary":
+            rcpt = parser.current_recipient
+            if rcpt and rcpt.startswith("functions."):
+                tool_parts.append(delta)
+                last_tool_recipient = rcpt
 
     t2 = time.perf_counter()
 
-    reply = "".join(reply_parts)
     gen_ms = (t2 - t1) * 1000
     tok_per_sec = gen_count / (t2 - t1) if (t2 - t1) > 0 else 0
 
-    logger.info(
-        "generate: input=%d tokens, output=%d tokens (final=%d), "
-        "encode=%.1fms, generate=%.1fms (%.1f tok/s), total=%.1fms, "
-        "channels=%s, reply_len=%d, truncated=%s",
-        len(tokens), gen_count, final_token_count,
-        (t1 - t0) * 1000, gen_ms, tok_per_sec, (t2 - t0) * 1000,
-        channels_seen, len(reply), truncated,
-    )
+    if last_tool_recipient and not final_parts:
+        args_str = "".join(tool_parts)
+        logger.info(
+            "generate_once: tool_call recipient=%s args_len=%d "
+            "input=%d output=%d encode=%.1fms gen=%.1fms (%.1f tok/s) channels=%s",
+            last_tool_recipient, len(args_str),
+            len(tokens), gen_count, (t1 - t0) * 1000, gen_ms, tok_per_sec, channels_seen,
+        )
+        return {
+            "type": "tool_call",
+            "recipient": last_tool_recipient,
+            "arguments": args_str,
+        }
 
-    return reply, truncated
+    reply = "".join(final_parts)
+    logger.info(
+        "generate_once: final reply_len=%d truncated=%s "
+        "input=%d output=%d (final=%d) encode=%.1fms gen=%.1fms (%.1f tok/s) channels=%s",
+        len(reply), truncated,
+        len(tokens), gen_count, final_token_count,
+        (t1 - t0) * 1000, gen_ms, tok_per_sec, channels_seen,
+    )
+    return {"type": "final", "reply": reply, "truncated": truncated}
+
+
+def agent_generate_reply(
+    prompt_messages: list[dict],
+    *,
+    user_id: str,
+    max_steps: int = 4,
+) -> tuple[str, bool]:
+    """
+    Run the analysis → tool_call → tool_result → final loop.
+    Returns (reply, was_truncated) matching the old generate_reply signature.
+
+    Tool-call exchanges live only inside this call's local message list and
+    are NOT persisted to the session history (they are regenerable on demand).
+    """
+    msgs = list(prompt_messages)
+
+    for step in range(max_steps):
+        out = generate_once(msgs)
+        if out["type"] == "final":
+            return out["reply"], out["truncated"]
+
+        recipient = out["recipient"]                      # "functions.<name>"
+        raw_args = out["arguments"]
+        tool_name = recipient.split(".", 1)[1] if "." in recipient else recipient
+
+        try:
+            args = json.loads(raw_args) if raw_args.strip() else {}
+        except json.JSONDecodeError:
+            result = {"error": "invalid JSON arguments", "raw": raw_args[:200]}
+        else:
+            try:
+                result = run_function_tool(tool_name, args, user_id=user_id)
+            except Exception as e:
+                logger.exception("tool %s raised", tool_name)
+                result = {"error": f"{type(e).__name__}: {e}"}
+
+        logger.info(
+            "agent_step=%d tool=%s args=%s result_keys=%s",
+            step, tool_name, args if isinstance(args, dict) else raw_args[:120],
+            list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+        )
+
+        # Echo the assistant's tool call so the next pass sees a coherent transcript.
+        msgs.append({
+            "role": "assistant",
+            "channel": "commentary",
+            "recipient": recipient,
+            "content": raw_args,
+        })
+        msgs.append({
+            "role": "tool",
+            "name": tool_name,
+            "content": json.dumps(result, ensure_ascii=False, default=str),
+        })
+
+    logger.warning("agent loop exhausted after %d steps without final", max_steps)
+    return "", False
 
 
 # =====================================================================
@@ -1127,7 +1303,7 @@ async def chat(req: ChatRequest):
     # Build prompt: system + live game state + last 100 messages
     inline_status = req.playerStatus.model_dump() if req.playerStatus else None
     prompt_messages = build_prompt_messages(req.user_id, history, inline_status=inline_status)
-    reply, truncated = generate_reply(prompt_messages)
+    reply, truncated = agent_generate_reply(prompt_messages, user_id=req.user_id)
 
     # Sanitize reply. For English/other: strip to latin-1 (TTS constraint).
     # For Japanese: TTS handles unicode, so keep CJK and strip only control chars.
