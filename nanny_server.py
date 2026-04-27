@@ -666,6 +666,7 @@ class ChatRequest(BaseModel):
     unlockedZones: Optional[list[int]] = None  # alias: JS sends camelCase
     scenario_id: Optional[str] = None  # top-level assistant persona; falls back to DEFAULT_SCENARIO_ID
     scenarioId: Optional[str] = None   # alias: JS sends camelCase
+    ephemeral: bool = False  # if True, skip session history (e.g. TTS idle trigger)
 
 
 class ChatResponse(BaseModel):
@@ -1458,6 +1459,11 @@ async def chat(req: ChatRequest):
 
     history = get_or_create_session(req.user_id)
 
+    # Ephemeral requests (e.g. TTS idle trigger) use a temporary copy of the
+    # history so the injected system message and reply never persist.
+    if req.ephemeral:
+        history = list(history)  # shallow copy — original session untouched
+
     # Detect system-injected messages (e.g. "[System: Player HP is critically low...]")
     # These come from the game client but should be treated as system instructions, not player input.
     if req.message.startswith("[System:"):
@@ -1509,8 +1515,10 @@ async def chat(req: ChatRequest):
                 req.user_id, raw_reply[:200],
             )
 
-    # Only store non-empty replies to avoid polluting history with blank assistant turns
-    if storable_reply:
+    # Only store non-empty replies to avoid polluting history with blank assistant turns.
+    # Ephemeral requests operate on a throwaway copy, so this append is a no-op for them,
+    # but we skip it explicitly for clarity.
+    if storable_reply and not req.ephemeral:
         history.append({"role": "assistant", "content": storable_reply})
     elif not reply:
         logger.warning(
