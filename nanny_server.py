@@ -133,7 +133,7 @@ Zones: see "Zone Progress" section below for the full list.
 - If the player asks about a blocked zone, explain the magic wall is in the way and they need to level up.
 
 # Game Objective
-{player_name} will explore, fight monsters, earn gold, buy equipment, level up, and collect rare "Monster Stones".
+{player_name} will explore, fight monsters, earn gold, level up, and collect rare "Monster Stones".
 Final goal: Collect Monster Stones and give them to you (the assistant/GM).
 
 # Starting Stats (only use these if no Live Game State is provided below and no prior conversation exists)
@@ -144,26 +144,25 @@ Gold: 0 | Monster Stones: 0 | EXP: 0
 
 # Core Mechanics
 ## Combat - Real-time action combat. The player fights with bare hands:
-- A button = KICK (not punch). A is always kick.
+- A button = ATTACK. The game automatically selects the optimal attack (kick, punch, etc.) based on the distance to the target. The selection is random among attacks whose range covers the enemy.
 - F button = PUNCH (not kick). F is always punch.
-- Do NOT confuse these. A=kick, F=punch. Never swap them.
 - The player does NOT have weapons, sticks, potions, or any items at the start. Do NOT mention items the player does not have.
-## Magic - The player can say "Cure" to restore HP (costs 1 MP). If HP drops below 30%, remind {player_name} to say "Cure".
-## Death - If HP is 0, the player is dead. Remind {player_name} to say "Revive" to come back to life.
+## Magic - The player has the following spells (each costs MP):
+- "Cure" — Restores HP. If HP drops below 30%, remind {player_name} to say "Cure".
+- "Robot" — Transforms the player into a robot for a limited time, buffing attack, defense, and speed.
+- "Warp" — Teleports the player to any zone they have previously visited.
+## Death & Revive - If HP is 0, the player is dead (game over). The player can say "Revive" to respawn at the spot where they fell with full HP and full MP. Revive has a limited number of uses per account — once the limit is reached, the player cannot revive anymore.
 ## Progression - Gain EXP + Gold from monsters. Level up increases stats. Acknowledge level-ups in your persona's voice.
 ## Monsters - No scary descriptions. Do NOT invent colors or appearances not listed here.
-- Slime: blue, round, similar to Dragon Quest 1 slime. NOT green. Weakest and slowest. Short melee range.
-- Ramia: a small bird-like creature. Fast (speed 1.5), long attack range (4.0), wide aggro (20.0). Hard to escape once spotted.
-- RedPanthor: a red panther. Very fast (speed 1.8), high ATK (25), 10% critical rate. Dangerous for low-level players.
-- Piccolo: a mysterious tall green creature. Highest ATK (35) and HP (200), 15% critical rate. Slow but deadly up close.
-- Kulilin: a tough bald fighter-type. Fast (speed 1.2), 12% critical rate, wide aggro (12.0). Strong and persistent.
+{monster_list}
 - See the "Enemies in this zone" section below for exact stats and damage calculations vs the player.
 ## IMPORTANT: Monster positions and spawns are controlled by the game server, not by you. Do NOT make up specific locations or directions for monsters. If asked where a monster is, say you are not sure and suggest looking around.
 ## Monster Stones - Rare drop from monsters. Important collection goal.
 
 # Exploration
-Encourage small discoveries, NPC conversations, shops, simple quests, hidden items.
-NPC examples: Gant (weapon shop), Mira (inn), Popo (item shop grandma), Tim (young adventurer)
+The only NPC is YOU — the assistant, a small winged slime flying beside {player_name}.
+There are no shops, inns, or other NPCs. Do NOT invent or mention any.
+When {player_name} visits a POI (Point of Interest), you read aloud the POI text on their behalf.
 
 # Conversation Style
 - Talk naturally with the player, in the voice and tone defined by your Persona.
@@ -263,7 +262,9 @@ def run_function_tool(name: str, args: dict, *, user_id: str) -> dict:
     `user_id` is taken from the /chat request context, never from the model.
     `args` is accepted but ignored (kept for forward compatibility)."""
     if name == "get_game_state":
-        return {"user_id": user_id, "rows": player_status_history.get(user_id, [])}
+        rows = player_status_history.get(user_id, [])
+        history = get_or_create_session(user_id)
+        return {"user_id": user_id, "summary": summarize_player_status(rows, history)}
     if name == "get_scenario_progress":
         return {"user_id": user_id, "progress": scenario_progress.get(user_id, {})}
     if name == "reset_session":
@@ -395,6 +396,34 @@ def _load_scenario_or_fallback(scenario_id: Optional[str]) -> Optional[dict]:
     return None
 
 
+def _format_monster_list() -> str:
+    """Build the monster catalogue from enemy_stats.json (pushed by gameserver).
+
+    Returns a compact line per monster with key combat traits so the LLM
+    can describe encounters without hardcoded descriptions.
+    """
+    stats = _load_enemy_stats()
+    if not stats:
+        return "- (No monster data loaded yet)"
+    lines = []
+    for name, s in sorted(stats.items(), key=lambda kv: kv[1].get("baseStats", {}).get("hp", 0)):
+        base = s.get("baseStats", {})
+        hp = base.get("hp", "?")
+        attacks = base.get("attacks", [])
+        atk_str = "/".join(str(a) for a in attacks) if attacks else "?"
+        defense = base.get("defense", "?")
+        speed = s.get("speed", "?")
+        aggro = s.get("aggroRange", "?")
+        crit = s.get("criticalRate", 0)
+        ranges = s.get("attackRanges", [])
+        range_str = "/".join(str(r) for r in ranges) if ranges else "?"
+        lines.append(
+            f"- {name}: HP:{hp} ATK:{atk_str} DEF:{defense} "
+            f"Speed:{speed} Aggro:{aggro} Range:{range_str} Crit:{crit*100:.0f}%"
+        )
+    return "\n".join(lines)
+
+
 def _format_zone_enemies(zone_id: int, player_attack: int = 3, player_defense: int = 1) -> str:
     """Format zone enemy table from scenario spawn actions for the system prompt."""
     zones = _flock_read_json(_ENV_ZONES_FILE, [])
@@ -431,15 +460,28 @@ def _format_zone_enemies(zone_id: int, player_attack: int = 3, player_defense: i
         if not s:
             lines.append(f"\n### {enemy_type} (x{total_count})")
             continue
-        enemy_dmg_to_player = max(1, s["attack"] - player_defense)
-        player_dmg_to_enemy = max(1, player_attack - s["defense"])
-        hits_to_kill = (s["hp"] + player_dmg_to_enemy - 1) // player_dmg_to_enemy
+        base = s.get("baseStats", {})
+        hp = base.get("hp", 0)
+        attacks = base.get("attacks", [0])
+        defense = base.get("defense", 0)
+        avg_atk = sum(attacks) // len(attacks) if attacks else 0
+        speed = s.get("speed", 0)
+        aggro = s.get("aggroRange", 0)
+        atk_ranges = s.get("attackRanges", [])
+        crit = s.get("criticalRate", 0)
+        exp_info = s.get("exp", {})
+        gold_info = s.get("goldDrop", {})
+        exp_avg = (exp_info.get("min", 0) + exp_info.get("max", 0)) // 2 if isinstance(exp_info, dict) else exp_info
+        gold_avg = (gold_info.get("min", 0) + gold_info.get("max", 0)) // 2 if isinstance(gold_info, dict) else gold_info
+        enemy_dmg_to_player = max(1, avg_atk - player_defense)
+        player_dmg_to_enemy = max(1, player_attack - defense)
+        hits_to_kill = (hp + player_dmg_to_enemy - 1) // player_dmg_to_enemy
         lines.append(f"\n### {enemy_type} (x{total_count} total in scenario)")
-        lines.append(f"  HP: {s['hp']} | ATK: {s['attack']} | DEF: {s['defense']}")
-        lines.append(f"  Speed: {s['speed']} | Attack range: {s['attackRange']} | Aggro range: {s['aggroRange']}")
-        lines.append(f"  Critical rate: {s['criticalRate']*100:.0f}%")
-        lines.append(f"  Rewards: {s['exp']} EXP, {s['goldDrop']} Gold")
-        lines.append(f"  -- vs player now: enemy deals {enemy_dmg_to_player} dmg/hit, player deals {player_dmg_to_enemy} dmg/hit, ~{hits_to_kill} hits to kill")
+        lines.append(f"  HP: {hp} | ATK: {'/'.join(str(a) for a in attacks)} | DEF: {defense}")
+        lines.append(f"  Speed: {speed} | Attack ranges: {'/'.join(str(r) for r in atk_ranges)} | Aggro range: {aggro}")
+        lines.append(f"  Critical rate: {crit*100:.0f}%")
+        lines.append(f"  Rewards: ~{exp_avg} EXP, ~{gold_avg} Gold")
+        lines.append(f"  -- vs player now: enemy deals ~{enemy_dmg_to_player} dmg/hit (avg), player deals {player_dmg_to_enemy} dmg/hit, ~{hits_to_kill} hits to kill")
     return "\n".join(lines)
 
 
@@ -478,11 +520,15 @@ def _format_scenario_context(user_id: str, zone_id: int) -> str:
         lines.append("Status: COMPLETED (all steps done)")
         return "\n".join(lines)
 
-    # Find current step index
+    # Resolve user lang for text extraction
+    user_lang = user_langs.get(user_id, "en-US")
+    lang_code = user_lang.split("-")[0].lower()
+
+    # Find current step index (scenario uses "id", not "step_id")
     current_idx = 0
     if current_step_id:
         for i, s in enumerate(zone_scenarios):
-            if s.get("step_id") == current_step_id:
+            if s.get("id") == current_step_id or s.get("step_id") == current_step_id:
                 current_idx = i
                 break
 
@@ -493,16 +539,37 @@ def _format_scenario_context(user_id: str, zone_id: int) -> str:
 
     for i in range(start, end):
         s = zone_scenarios[i]
-        sid = s.get("step_id", str(i).zfill(3))
+        sid = s.get("id") or s.get("step_id", str(i).zfill(3))
         action = s.get("action", "?")
-        msg = s.get("message", "")
+        # Extract text: "text" can be a dict {ja, en} or a plain string "message"
+        raw_text = s.get("text") or s.get("message") or ""
+        if isinstance(raw_text, dict):
+            msg = raw_text.get(lang_code) or raw_text.get("en") or ""
+        else:
+            msg = raw_text
         voice = s.get("voice", "")
         marker = " <<< CURRENT" if i == current_idx else ""
         if action == "message" and msg:
             lines.append(f"  [{sid}] {action}: \"{msg}\" (voice={voice}){marker}")
+        elif action == "condition":
+            ctype = s.get("type", "")
+            detail = ""
+            if ctype == "enemies_defeated":
+                detail = f" enemies={s.get('enemies', [])}"
+            elif ctype == "level_reached":
+                detail = f" lv>={s.get('level', '?')}"
+            elif ctype == "player_moved":
+                detail = f" dist>={s.get('distance', '?')}"
+            elif ctype == "chest_opened":
+                detail = f" item={s.get('item', '?')}"
+            lines.append(f"  [{sid}] {action}: {ctype}{detail}{marker}")
+        elif action == "spawn":
+            lines.append(f"  [{sid}] {action}: {s.get('enemy', '?')} x{s.get('count', 1)}{marker}")
         else:
             lines.append(f"  [{sid}] {action}{marker}")
 
+    lines.append("Action key: message=dialogue, spawn=enemies appear, condition=waiting for player action, "
+                  "spawn_chest=chest appears, terminal_log=network terminal output, camera=cinematic shot")
     lines.append("IMPORTANT: Follow this scenario. Do NOT narrate anything beyond the current step.")
     return "\n".join(lines)
 
@@ -637,9 +704,10 @@ class ScenarioRow(BaseModel):
 
 
 class GameConfigRequest(BaseModel):
-    """Game server pushes zones + scenarios at startup."""
+    """Game server pushes zones + scenarios + monsters at startup."""
     zones: list[ZoneRow]
     scenarios: Optional[list[ScenarioRow]] = None
+    monsters: Optional[dict] = None  # {name: {merged params}} from monsters table
 
 
 class PlayerStatusRow(BaseModel):
@@ -674,6 +742,98 @@ class GameEvent(BaseModel):
 # =====================================================================
 # Long-term memory  (game server → POST /game_state)
 # =====================================================================
+
+def summarize_player_status(rows: list[dict], history: list[dict] = None) -> dict:
+    """Summarize player_status history into structured JSON for tool results.
+
+    Uses the most recent 30 rows to capture recent trends without
+    being diluted by old history. Returns a compact dict optimized
+    for LLM token efficiency.
+
+    If session history is provided, enemy kill events are aggregated
+    (e.g. {"Slime": 2, "Ramia": 3}).
+    """
+    if not rows:
+        return {"error": "no_data"}
+
+    zone_names = _load_zone_names()
+    recent = rows[:30]
+    latest = recent[0]
+    oldest = recent[-1] if len(recent) > 1 else latest
+    zone = zone_names.get(latest.get("zone_id", 0), f"Zone {latest.get('zone_id', '?')}")
+
+    summary = {
+        "lv": latest["lv"],
+        "hp": [latest["hp"], latest["max_hp"]],
+        "mp": [latest["mp"], latest["max_mp"]],
+        "atk": latest["attack"],
+        "def": latest["defense"],
+        "exp": latest["exp"],
+        "gold": latest["gold"],
+        "zone": zone,
+        "dead": bool(latest.get("is_dead")),
+    }
+
+    if len(recent) < 2:
+        return summary
+
+    # Recent trends (from oldest→latest in the 30-row window)
+    changes = {}
+
+    if latest["lv"] != oldest["lv"]:
+        changes["lv"] = [oldest["lv"], latest["lv"]]
+
+    # Zone transitions
+    zone_seq = []
+    for r in reversed(recent):
+        zid = r.get("zone_id")
+        if not zone_seq or zone_seq[-1] != zid:
+            zone_seq.append(zid)
+    if len(zone_seq) > 1:
+        changes["zones"] = [zone_names.get(z, str(z)) for z in zone_seq]
+
+    # Death count
+    death_count = sum(1 for i in range(len(recent) - 1)
+                      if recent[i].get("is_dead") and not recent[i + 1].get("is_dead"))
+    if death_count:
+        changes["deaths"] = death_count
+
+    gold_diff = latest["gold"] - oldest["gold"]
+    exp_diff = latest["exp"] - oldest["exp"]
+    if gold_diff:
+        changes["gold_diff"] = gold_diff
+    if exp_diff:
+        changes["exp_diff"] = exp_diff
+
+    # Enemy kills from session history
+    if history:
+        kills: dict[str, int] = {}
+        for msg in history:
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content", "")
+            for line in content.split("\n"):
+                if "[Game Event: enemy_killed] Defeated " in line:
+                    enemy = line.split("Defeated ", 1)[1].strip()
+                    kills[enemy] = kills.get(enemy, 0) + 1
+        if kills:
+            changes["kills"] = kills
+
+    if changes:
+        summary["recent"] = changes
+
+    # Recent chat (last 10 user/assistant turns for context)
+    if history:
+        chat = []
+        for msg in history:
+            if msg.get("role") in ("user", "assistant"):
+                content = msg["content"]
+                chat.append({"r": msg["role"][0], "t": content[:80]})
+        if chat:
+            summary["chat"] = chat[-10:]
+
+    return summary
+
 
 def status_to_prompt_block(rows: list[dict]) -> str:
     """
@@ -814,6 +974,7 @@ def build_prompt_messages(
         .replace("{scenario_response_rules}", scenario_response_rules)
         .replace("{player_name}", player_name)
         .replace("{lang_instruction}", lang_instruction)
+        .replace("{monster_list}", _format_monster_list())
     )
 
     # Determine current player stats from available sources
@@ -1186,6 +1347,10 @@ async def receive_game_config(cfg: GameConfigRequest):
     _flock_write_json(_ENV_ZONE_NAMES_FILE, new_zone_names)
     _flock_write_json(_ENV_ZONE_UNLOCK_FILE, new_zone_unlock)
 
+    # --- Persist monsters ---
+    if cfg.monsters:
+        _flock_write_json(_ENV_ENEMY_STATS_FILE, cfg.monsters)
+
     # --- Persist scenarios (one file per scenario_id) ---
     scenario_ids: list[str] = []
     if cfg.scenarios:
@@ -1195,8 +1360,8 @@ async def receive_game_config(cfg: GameConfigRequest):
             scenario_ids.append(sc.scenario_id)
 
     logger.info(
-        "game_config: loaded %d zones, %d scenarios. ZONE_NAMES=%s SCENARIOS=%s",
-        len(cfg.zones), len(scenario_ids), new_zone_names, scenario_ids,
+        "game_config: loaded %d zones, %d scenarios, %d monsters. ZONE_NAMES=%s SCENARIOS=%s",
+        len(cfg.zones), len(scenario_ids), len(cfg.monsters or {}), new_zone_names, scenario_ids,
     )
     return {
         "status": "ok",
