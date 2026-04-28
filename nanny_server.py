@@ -1102,7 +1102,7 @@ def _to_harmony_messages(prompt_messages: list[dict]) -> list[Message]:
                 # Model-level system message (identity, reasoning, channel policy)
                 sys_content = (
                     SystemContent.new()
-                    .with_reasoning_effort(ReasoningEffort.LOW)
+                    .with_reasoning_effort(ReasoningEffort.MEDIUM)
                     .with_conversation_start_date(
                         datetime.datetime.now().strftime("%Y-%m-%d")
                     )
@@ -1153,7 +1153,7 @@ def _to_harmony_messages(prompt_messages: list[dict]) -> list[Message]:
 
 def generate_once(
     prompt_messages: list[dict],
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 512,
     max_reply_tokens: int = 80,
 ) -> dict:
     """
@@ -1170,6 +1170,13 @@ def generate_once(
     harmony_msgs = _to_harmony_messages(prompt_messages)
     conversation = Conversation.from_messages(harmony_msgs)
     tokens = encoding.render_conversation_for_completion(conversation, Role.ASSISTANT)
+    # Force the model to start in the analysis channel. Without this the model
+    # imitates prior assistant turns in history (which only contain the final
+    # channel) and skips reasoning entirely, producing pattern-matched replies.
+    analysis_prefill = encoding.encode(
+        "<|channel|>analysis<|message|>", allowed_special="all"
+    )
+    tokens = tokens + analysis_prefill
     stop_tokens = encoding.stop_tokens_for_assistant_actions()
 
     decoded_prompt = encoding.decode(tokens)
@@ -1178,6 +1185,11 @@ def generate_once(
     t1 = time.perf_counter()
 
     parser = StreamableParser(encoding, role=Role.ASSISTANT)
+    # Replay the prefill tokens through the parser so it knows the assistant
+    # message has opened in the analysis channel. Otherwise the parser stays
+    # in the "message header" state and chokes on the first generated token.
+    for t in analysis_prefill:
+        parser.process(t)
     final_parts: list[str] = []
     tool_parts: list[str] = []
     last_tool_recipient: Optional[str] = None
