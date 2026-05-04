@@ -1,16 +1,17 @@
 # Professor LT System -- 設計ドキュメント
 
-論文 PDF をアップロードすると、スライド生成 → スピーカースクリプト生成 → RAG インデックス構築を経て、3D アバター付きのライブ研究発表を行う AI プレゼンテーションシステム。
+ラボ／グループが持つ**高度なドメイン知識なしには読み解けない局所知識** (論文等に書かれてはいるが、行間を読むには専門的文脈が必要な実装判断・実験設計の意図・失敗から得た知見) を、RAG + 遊休 GPU + WebSocket トンネルで**セキュアに社内公開**する知識流通インフラ。
 
----
+各ラボ／グループは NAT 内の GPU マシン上で独自 RAG を保持し、データを外に出さずに知識 API として機能する。フロントエンドでは、各ラボ／グループの局所知識サマリーからノードを選択し、そのラボが保持するスライド化されたペーパーを検索・閲覧できる。選択したラボ／グループとの Q&A を通じて局所知識に特化した知見を得ることができ、3D アバター付きライブ発表として具現化される。ペーパーのアップロード・削除は当該ラボ／グループによって精査・管理される。
 
-## 1. システム概要
+## システム概要
 
-![システム概要](./professor.svg)
+<img src="./professor.svg" style="max-height: 50vh; width: auto;" />
 
----
 
-## 2. ファイル構成と責務
+<div style="page-break-before: always;"></div>
+
+## ファイル構成と責務
 
 | ファイル | 役割 |
 |---------|------|
@@ -21,13 +22,14 @@
 | `html/js/professor.js` | フロントエンドロジック。TTS 再生、アバターアニメーション、スライド遷移、アップロード UI |
 | `html/js/auth.js` | Google OAuth ラッパー。ドメイン制限付きサインイン、セッション管理 |
 | `~/git/paper/myboy/aws/proxy_server.py` | AWS 上のリバースプロキシ。WebSocket トンネル管理、HTTP/ストリームリレー |
-| `~/git/paper/myboy/aws/tunnel_client.py` | NAT 内から Proxy へ outbound WebSocket 接続、ローカルサーバーへ���リクエスト中継 |
+| `~/git/paper/myboy/aws/tunnel_client.py` | NAT 内から Proxy へ outbound WebSocket 接続、ローカルサーバーへリクエスト中継 |
+| `~/git/Qwen3-TTS-streaming/server-design.py` | TTS ストリーミングサーバー。PCM 音声生成・配信 |
 
----
 
-## 3. API エンドポイント
+<div style="page-break-before: always;"></div>
 
-### 3.1 チャット・設定
+## API エンドポイント
+### チャット・設定
 
 | Method | Path | 説明 |
 |--------|------|------|
@@ -37,7 +39,7 @@
 | GET | `/api/history` | ユーザー別会話履歴 |
 | POST | `/api/reset` | セッション履歴クリア |
 
-### 3.2 認証
+### 認証
 
 | Method | Path | 説明 |
 |--------|------|------|
@@ -45,7 +47,7 @@
 | GET | `/api/auth/check` | セッション検証 |
 | POST | `/api/auth/logout` | サインアウト |
 
-### 3.3 プレゼンス・Q&A
+### プレゼンス・Q&A
 
 | Method | Path | 説明 |
 |--------|------|------|
@@ -55,7 +57,7 @@
 | PUT | `/api/qa/{qa_id}` | Q&A エントリ編集 (発表者のみ) |
 | DELETE | `/api/qa/{qa_id}` | Q&A エントリ削除 |
 
-### 3.4 論文アップロード
+### 論文アップロード
 
 | Method | Path | 説明 |
 |--------|------|------|
@@ -70,28 +72,61 @@
 | GET | `/api/upload/eligibility` | アップロード/削除チケット残数 |
 | GET | `/api/meta` | 現在の発表メタデータ (テーマ/発表者/会場) |
 
-### 3.5 TTS プロキシ
+### TTS プロキシ
 
 | Method | Path | 説明 |
 |--------|------|------|
 | POST | `/api/tts/generate_stream` | 外部 TTS バックエンドへのストリーミングプロキシ (PCM 音声) |
 
----
 
-## 4. ネットワークアーキテクチャ (Tunnel/Proxy)
+<div style="page-break-before: always;"></div>
 
-ブラウザは `your_professor_server.py` に直接接続しない。
-NAT 内のサーバーに外部からアクセスするため、WebSocket トンネルによるリバースプロキシ構成を取る。
+## ラボ／グループの知識ノードをセキュアにシェアする
 
-```
-Browser ──HTTPS──▶ proxy_server.py (AWS ELB/EC2)
-                        ▲
-                        │ WebSocket (NAT 内から outbound 接続)
-                        │
-                   tunnel_client.py ──localhost──▶ your_professor_server.py
-```
+<img src="./professor-nat.svg" style="max-height: 90vh; width: auto;" />
 
-### 4.1 接続フロー
+各ラボ／グループは、論文には書かれない**局所的で尖った知識**を持っている:
+
+| ラボ／グループ | 保有知識の例 |
+|--------|-------------|
+| RealTime/SFU 特化ラボ／グループ | パケットロス時の再送戦略、SFU 実装の勘所 |
+| 音声認識ラボ／グループ | ノイズ環境での前処理パイプライン、失敗した手法のログ |
+| ネットワーク QoS ラボ／グループ | 実測ベースの帯域制御パラメータ、ベンダー固有の挙動 |
+
+LLM は平均化された知識を返す。ラボ／グループ RAG は**濃度の高い局所知識**を返す。
+この差が価値の源泉であり、本システムはそれを**セキュアに外部へシェアする**ためのインフラである。
+
+**設計原則:**
+
+- **データはラボ／グループの外に出ない** — 各ノードが自身の RAG とアクセス制御を保持し、Proxy はリレーするだけ
+- **Authority 付き応答** — 「A ラボ／グループの知見です」と出典が付く。出所不明の RAG 回答とは信頼性が段違い
+- **ノードの自律性** — ラボ／グループごとに公開範囲・参加・離脱を自己決定できる
+
+**実現手段 — WebSocket トンネル:**
+
+ラボ／グループの GPU マシンは NAT/ファイアウォール内にある。
+各ノードが NAT 内から **outbound WebSocket** でクラウド Proxy に接続することで、
+インバウンドポート開放や VPN なしに、ラボ／グループのセキュリティポリシーを壊さず公開できる。
+
+| 設計選択 | 効果 |
+|----------|------|
+| NAT 内から outbound WebSocket | ファイアウォール変更不要 |
+| AWS ELB + Proxy が TLS 終端 | 証明書管理をクラウド側に集約 |
+| Operator ID ルーティング | DNS 変更なしで知識ノードを動的に追加・差し替え |
+| 各ノードが GPU を自前保持 | ラボ／グループの遊休 GPU を活用、クラウド GPU コストは Proxy の EC2 のみ |
+
+**拡張: 分散 RAG ネットワークへ**
+
+現在は単一ノード構成だが、Operator ID ルーティングにより複数ノードへ自然に拡張できる:
+
+1. クエリが Proxy に到着
+2. クエリ内容から最適な知識ノード (ラボ／グループ) にルーティング
+3. 該当ノードが自身の RAG で検索・応答
+4. 応答に Authority (出典ラボ／グループ) を付与
+
+これは検索エンジンではなく、**専門知識の流通インフラ** である。
+
+### 接続フロー
 
 1. `tunnel_client.py` が NAT 内から `proxy_server.py` へ WebSocket 接続 (outbound)
 2. `register` アクションで operator_id (UUID) + display_name を登録
@@ -99,7 +134,8 @@ Browser ──HTTPS──▶ proxy_server.py (AWS ELB/EC2)
 4. ブラウザは Proxy の `/api/tunnel/info` でリレー先一覧を取得
 5. リクエスト時に `X-Operator-ID` ヘッダー or `?operator_id=` で対象トンネルを指定
 
-### 4.2 リクエストリレー
+
+### リクエストリレー
 
 | 種別 | 方式 | 用途 |
 |------|------|------|
@@ -107,15 +143,12 @@ Browser ──HTTPS──▶ proxy_server.py (AWS ELB/EC2)
 | ストリーム | Channel + Queue ベース、複数ブラウザで同一チャネルを共有 (マルチキャスト) | `/api/tts/generate_stream`, `/api/video/stream` |
 
 制御リクエストのリレー:
-```
-Browser → Proxy: HTTP request
-Proxy → Tunnel: {"action": "forward", "request_id": uuid, "method": ..., "path": ..., "body_b64": ...}
-Tunnel → Local Server: httpx.AsyncClient.request(localhost)
-Tunnel → Proxy: {"action": "response", "request_id": uuid, "status": ..., "body_b64": ...}
-Proxy → Browser: HTTP response (15秒タイムアウト)
-```
 
-### 4.3 Operator ルーティング
+<div style="page-break-before: always;"></div>
+
+<img src="./professor-relay.svg" style="max-height: 90vh; width: auto;" />
+
+### Operator ルーティング
 
 | 優先度 | 方式 |
 |--------|------|
@@ -124,93 +157,38 @@ Proxy → Browser: HTTP response (15秒タイムアウト)
 | 3 | パスベースの role マッチング (`/api/video/*` → device, その他 → gameserver) |
 | 4 | フォールバック: 最初の利用可能なトンネル |
 
----
 
-## 5. コアデータフロー
+<div style="page-break-before: always;"></div>
 
-### 5.1 ライブ発表フロー
+## コアデータフロー
+### ライブ発表フロー
 
-```
-1. ブラウザ起動
-   → /api/auth/check → /api/config → /api/deck → /api/upload/papers
-   → /api/presence/heartbeat (10秒毎)
+<img src="./professor-live-flow.svg" style="max-height: 90vh; width: auto;" />
 
-2. ユーザーが「Speak」クリック
-   → POST /api/chat {stage: "presenting", slide: {title, bullets}}
-   → サーバー: build_prompt_messages()
-      ├── システムプロンプト (ペルソナ=著者+所属, テーマ)
-      ├── [Stage] セクション
-      ├── [Slide] セクション (タイトル + バレットポイント)
-      ├── [Knowledge Context] (paper_rag.search 結果, top_k=5)
-      └── 直近100ターンの履歴 (連続同一ロールはマージ)
-   → vLLM 推論 (Harmony エンコーディング, analysis → final チャネル)
-   → レスポンス: {reply, stage, slide_page, voice}
+<div style="page-break-before: always;"></div>
 
-3. TTS 再生
-   → sanitizeForTTS() → splitForTTS() (~40文字チャンク)
-   → 各チャンク: POST /api/tts/generate_stream → PCM ストリーム
-   → Web Audio API で逐次再生 + アバターアニメーション切替
-```
+### 挙手 (Q&A) フロー
 
-### 5.2 挙手 (Q&A) フロー
+<img src="./professor-qa-flow.svg" style="max-height: 90vh; width: auto;" />
 
-```
-1. 発話中にユーザーが「挙手」クリック
-   → TTS 中断 → 確認フレーズ再生 → 質問入力待ち
+<div style="page-break-before: always;"></div>
 
-2. 質問入力 + Ask
-   → POST /api/chat {stage: "qa", message: "【聴衆からの質問】..."}
-   → RAG 検索 (top_k=2) + LLM 推論 → TTS 再生
-   → 再開フレーズ ("それでは、発表を続けさせていただきます。")
+### 論文アップロードパイプライン
 
-3. 30秒間入力なし → 自動再開
-```
+<img src="./professor-upload-pipeline.svg" style="max-height: 90vh; width: auto;" />
 
-### 5.3 論文アップロードパイプライン
+<div style="page-break-before: always;"></div>
 
-```
-1. ブラウザ: PDF 選択 → POST /api/upload/presign
-   → S3 署名付き URL + job_id 発行
+### RAG インデックス再構築
 
-2. ブラウザ: PUT PDF → S3 直接アップロード
+<img src="./professor-rag-index-rebuild.svg" style="max-height: 90vh; width: auto;" />
 
-3. POST /api/upload/start {job_id}
-   → チケット消費 (アトミックファイルリネーム)
-   → バックグラウンドタスク起動
 
-4. バックグラウンド処理:
-   a. S3 から PDF ダウンロード → professor_data/uploads/{job_id}/
-   b. 外部コーパスディレクトリへコピー
-   c. Knowledge Context 構築
-      - PDF 冒頭テキスト抽出
-      - LLM (gpt-5.2) でクエリリライト (日本語3 + 英語3 = 6クエリ)
-      - paper_rag.search() × 各クエリ → 自己参照除外 → 重複排除
-      - knowledge_context.md 書き出し
-   d. generate_slides.py (PDF → HTML スライド + essence メタデータ)
-   e. html2pdf.mjs (HTML → PDF 中間ファイル)
-   f. generate_scripts.py (PDF + スライドPDF → スピーカースクリプト)
-   g. current_meta 更新 (テーマ/発表者/所属/会場 → LLM ペルソナに反映)
-   h. RAG インデックス再構築キュー投入
+<div style="page-break-before: always;"></div>
 
-5. ブラウザ: 10秒ポーリング → ログ表示 → 完了時 iframe にスライド表示
-```
+## RAG アーキテクチャ
 
-### 5.4 RAG インデックス再構築
-
-```
-FIFO キュー (単一ワーカー) で逐次実行:
-1. build_paper_index.py (サブプロセス)
-   → ファイル発見 → テキスト抽出 → チャンク分割 → 埋め込み → LanceDB 永続化
-2. paper_rag.reload_index()
-   → 新しい埋め込みモデル + インデックスをロード
-   → _swap_lock 下でアトミックスワップ (検索中のリクエストは旧スナップショット参照)
-```
-
----
-
-## 6. RAG アーキテクチャ
-
-### 6.1 インデックス構築 (build_paper_index.py)
+### インデックス構築 (build_paper_index.py)
 
 | ステップ | 詳細 |
 |---------|------|
@@ -221,7 +199,7 @@ FIFO キュー (単一ワーカー) で逐次実行:
 | 埋め込み | Qwen/Qwen3-Embedding-0.6B、バッチサイズ 8、正規化あり |
 | 永続化 | LanceDB `chunks` テーブル (upsert) + `meta.json` マニフェスト |
 
-### 6.2 検索 (paper_rag.py)
+### 検索 (paper_rag.py)
 
 ```
 search(query, top_k=5)
@@ -235,11 +213,12 @@ search(query, top_k=5)
 - **スレッド安全**: `_swap_lock` でリロード中の検索は旧スナップショットを参照
 - **グレースフルデグラデーション**: インデックス未構築時は空リスト返却、LLM はスライド内容のみで生成
 
----
 
-## 7. LLM プロンプト設計
+<div style="page-break-before: always;"></div>
 
-### 7.1 システムプロンプト
+## LLM プロンプト設計
+
+### システムプロンプト
 
 ペルソナは論文ごとに動的に切り替わる。essence メタデータから `著者` / `所属` を抽出し、
 システムプロンプトの冒頭に注入する。
@@ -275,17 +254,18 @@ search(query, top_k=5)
 - 論文粋にない数値・主張の捏造禁止
 - `[Slide]` と矛盾時はスライド優先
 
-### 7.2 RAG クエリリライト (アップロード時)
+### RAG クエリリライト (アップロード時)
 
 gpt-5.2 で PDF 冒頭テキストから 6 クエリ生成:
 - 3 観点 (methods / domain / evaluation) x 2 言語 (日本語 / 英語)
 - 出力: `{summary, summary_en, queries_ja: [3], queries_en: [3]}`
 
----
 
-## 8. フロントエンド設計
+<div style="page-break-before: always;"></div>
 
-### 8.1 レイアウト (3 カラム)
+## フロントエンド設計
+
+### レイアウト (3 カラム)
 
 | カラム | 幅比 | 内容 |
 |-------|------|------|
@@ -293,45 +273,33 @@ gpt-5.2 で PDF 冒頭テキストから 6 クエリ生成:
 | 中央 | 238% | スライドビューア (deck.json or iframe) + スピーカースクリプトペイン |
 | 右 | 72% | 参加者サイドバー + Q&A タイムライン |
 
-### 8.2 TTS パイプライン
+<div style="page-break-before: always;"></div>
 
-```
-テキスト → sanitizeForTTS() → splitForTTS() → speakChunk() × N
-                                   │
-                         ~40文字チャンク (。、で分割)
-                         最大80文字制限
-```
+### TTS パイプライン
 
-- Web Audio API (lazy allocate, Safari/iOS resume 対応)
-- チャンク間ギャップ/オーバーラップ回避 (nextStartTime 計算)
+<img src="./professor-tts.svg" style="max-height: 90vh; width: auto;" />
 
-### 8.3 アバターアニメーション
+### アバターアニメーション
 
 - Three.js AnimationMixer + GLB クリップ
 - 2 プール: idle / speaking (フェード遷移 250ms)
 - `finished` イベントで現在のプールから次クリップ選択
 
-### 8.4 自動進行ロジック
+### 自動進行ロジック
 
-```
-スライド発話完了
-  → 「コメント、質問等ございますでしょうか」 (8秒待機)
-  → 挙手なし → 「次に進めたいと思います」 (3秒待機)
-  → 自動 Next クリック → 次スライドのスクリプト再生
-```
+<img src="./professor-auto-paging.svg" style="max-height: 90vh; width: auto;" />
 
----
 
-## 9. 認証・アクセス制御
+<div style="page-break-before: always;"></div>
+
+## 認証・アクセス制御
 
 - **Google OAuth**: mixi.co.jp ドメイン制限 + `.custom-auth.txt` カスタム許可リスト
 - **チケットシステム**: アップロード/削除はシングルユースチケット (ファイルリネームによるアトミック消費)
   - `.ticket.available` → `.ticket.consumed` (成功時)
   - 同時消費はリネーム競合で一方のみ成功 (レースセーフ)
 
----
-
-## 10. 状態管理
+## 状態管理
 
 | データ | 保存先 | 永続性 |
 |--------|--------|--------|
@@ -344,92 +312,20 @@ gpt-5.2 で PDF 冒頭テキストから 6 クエリ生成:
 | RAG インデックス | `professor_data/index/` (LanceDB + meta.json) | 永続 |
 | チケット | `professor_data/tickets/` | ファイルベース永続 |
 
----
 
-## 11. ステートフル/ステートレス設計判断
+## ステートフル/ステートレス設計判断
 
 | ステージ | 種別 | 理由 |
 |---------|------|------|
 | presenting | ステートフル (履歴永続化) | スライド間で重複説明を避けるため |
 | waiting / qa / closing | ステートレス (エフェメラル) | 独立生成、長い回答が挨拶にエコーされるのを防止 |
 
----
 
-## 12. 外部依存
+<div style="page-break-before: always;"></div>
 
-| サービス | 用途 | 設定 |
-|---------|------|------|
-| vLLM (gpt-oss-20b) | テキスト生成 | Harmony エンコーディング、analysis → final チャネル |
-| TTS Backend | 音声合成 | `http://192.168.124.251:8889`、PCM ストリーミング、10 秒タイムアウト |
-| S3 (monst-static-assets) | PDF アップロード保存 | `professor_uploads/`、署名付き URL (300 秒)、最大 30MB |
-| proxy_server.py (AWS ELB) | リバースプロキシ / トンネルレジストリ | WebSocket トンネル経由でリレー |
-| tunnel_client.py | NAT 内 → Proxy outbound 接続 | `PROXY_WS_URL` で接続先指定 |
-| generate_slides.py | PDF → HTML スライド生成 | サブプロセス実行 |
-| html2pdf.mjs | HTML → PDF 変換 | Puppeteer/Chromium |
-| generate_scripts.py | スピーカースクリプト生成 | サブプロセス実行 |
+## 付録: 運用メモ
 
----
-
-## 13. エラーハンドリング・グレースフルデグラデーション
-
-| 障害 | 挙動 |
-|------|------|
-| RAG 未構築 / ロード失敗 | `search()` → 空リスト、LLM はスライド内容のみで生成 |
-| TTS タイムアウト | AbortError キャッチ、バッファ済み音声はそのまま再生 |
-| S3 障害 | ジョブを error 状態に、チケット未消費 (ロールバック) |
-| サブプロセス失敗 | ログテール保存、モーダルに終了コード + エラー表示 |
-| チケット競合 | リネーム失敗側が FileNotFoundError → 403 |
-| Knowledge Context 構築失敗 | None 返却、パイプライン続行 |
-| クエリリライト LLM 失敗 | PDF 冒頭テキストでの単一クエリにフォールバック |
-
----
-
-## 14. 環境変数一覧
-
-### サーバー (your_professor_server.py)
-
-```
-PRESENCE_TIMEOUT_S=30
-QA_TIMELINE_MAX=200
-TTS_BACKEND=http://192.168.124.251:8889
-TTS_TIMEOUT_S=10
-S3_UPLOAD_BUCKET=monst-static-assets
-S3_UPLOAD_PREFIX=professor_uploads/
-S3_UPLOAD_REGION=ap-northeast-1
-S3_PRESIGN_TTL_S=300
-UPLOAD_PDF_MAX_MB=30
-GOOGLE_CLIENT_ID=349549531314-...
-ALLOWED_EMAIL_DOMAIN=mixi.co.jp
-CUSTOM_AUTH_FILE=.custom-auth.txt
-CORS_ORIGINS=*
-TICKETS_DIR=professor_data/tickets
-KNOWLEDGE_CONTEXT_TOP_K=8
-KNOWLEDGE_REWRITER_MODEL=gpt-5.2
-EXTERNAL_PDF_DIR=~/git/paper/external-pdf-for-rag
-```
-
-### RAG (paper_rag.py)
-
-```
-PAPER_RAG_DEVICE=cpu
-PAPER_RAG_RERANK=1
-PAPER_RAG_RERANKER=BAAI/bge-reranker-v2-m3
-PAPER_RAG_RERANKER_DEVICE=cpu
-```
-
-### インデックスビルダー (build_paper_index.py)
-
-```
---paper-dir ~/git/paper
---upload-dir professor_data/uploads
---output professor_data/index
---model Qwen/Qwen3-Embedding-0.6B
---batch-size 8
-```
-
----
-
-## 15. デプロイメントディレクトリ構造
+### データディレクトリ
 
 ```
 professor_data/
