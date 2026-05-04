@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>D.Sugisawa LT</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    font-family: 'Hiragino Sans', 'Yu Gothic', 'Segoe UI', sans-serif;
+    background: linear-gradient(135deg, #0d1226 0%, #16213e 50%, #0f3460 100%);
+    color: #e6e6f0;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    height: 100vh;
+  }
+  header {
+    padding: 14px 20px;
+    background: rgba(0,0,0,0.35);
+    border-bottom: 1px solid rgba(233, 69, 96, 0.5);
+  }
+  header h1 { font-size: 1.05em; line-height: 1.4; color: #f5f5fa; }
+  header .meta { font-size: 0.78em; color: #98a0c0; margin-top: 2px; }
+
+  main {
+    display: grid;
+    grid-template-columns: minmax(112px, 0.4fr) 2.38fr minmax(208px, 0.72fr);
+    gap: 16px;
+    padding: 16px;
+    overflow: hidden;
+  }
+  #avatar {
+    border-radius: 12px;
+    border: 1px solid #3a4870;
+    position: relative;
+    overflow: hidden;
+    background-color: #95a0b8;   /* fallback before JS animation kicks in */
+  }
+  /* Background layers (slow, subtle):
+     - .bg-color  : warm/cool color cycle, 40s
+     - .bg-pattern: 4 geometric patterns each fade in for ~10s, staggered */
+  #avatar .bg-color,
+  #avatar .bg-pattern {
+    position: absolute; inset: 0; pointer-events: none;
+  }
+  #avatar .bg-color {
+    z-index: 0;
+    animation: prof-color 40s ease-in-out infinite;
+  }
+  #avatar .bg-pattern {
+    z-index: 1;
+    opacity: 0;
+    mix-blend-mode: overlay;
+  }
+  #avatar .bg-pattern.p1 {
+    /* diagonal 45° */
+    background-image: repeating-linear-gradient(
+      45deg, transparent 0 14px, rgba(255,255,255,0.45) 14px 15px);
+    animation: prof-pat 40s ease-in-out infinite 0s;
+  }
+  #avatar .bg-pattern.p2 {
+    /* horizontal */
+    background-image: repeating-linear-gradient(
+      0deg, transparent 0 18px, rgba(255,255,255,0.45) 18px 19px);
+    animation: prof-pat 40s ease-in-out infinite 10s;
+  }
+  #avatar .bg-pattern.p3 {
+    /* vertical */
+    background-image: repeating-linear-gradient(
+      90deg, transparent 0 18px, rgba(255,255,255,0.45) 18px 19px);
+    animation: prof-pat 40s ease-in-out infinite 20s;
+  }
+  #avatar .bg-pattern.p4 {
+    /* cross-hatch (45° + -45°) */
+    background-image:
+      repeating-linear-gradient(45deg, transparent 0 14px, rgba(255,255,255,0.45) 14px 15px),
+      repeating-linear-gradient(-45deg, transparent 0 14px, rgba(255,255,255,0.45) 14px 15px);
+    animation: prof-pat 40s ease-in-out infinite 30s;
+  }
+  #avatar canvas {
+    position: relative;
+    z-index: 2;
+    display: block; width: 100%; height: 100%;
+  }
+  #avatar .speaking-dot {
+    position: absolute; bottom: 12px; right: 12px;
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #2c3a55; transition: background 0.2s;
+    z-index: 3;
+  }
+  #avatar.speaking .speaking-dot { background: #5ad08b; box-shadow: 0 0 12px #5ad08b; }
+
+  @keyframes prof-color {
+    0%, 100% { background-color: #95a0b8; }   /* cool blue-gray */
+    50%      { background-color: #b3a890; }   /* warm tan */
+  }
+  @keyframes prof-pat {
+    0%, 50%, 100% { opacity: 0; }
+    25%           { opacity: 0.35; }
+  }
+
+  #slide {
+    background: rgba(255,255,255,0.04);
+    border-radius: 12px;
+    border: 1px solid #1a2245;
+    padding: 28px 32px;
+    display: flex; flex-direction: column;
+    overflow-y: auto;
+  }
+  #slide .page-num { color: #98a0c0; font-size: 0.85em; margin-bottom: 10px; }
+  #slide h2 { font-size: 1.6em; color: #f5f5fa; margin-bottom: 18px; line-height: 1.3; }
+  #slide ul { list-style: none; padding: 0; }
+  #slide li {
+    padding: 10px 0 10px 24px;
+    position: relative;
+    font-size: 1.05em;
+    line-height: 1.6;
+    color: #d5d8e8;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  #slide li:before {
+    content: ""; position: absolute; left: 4px; top: 18px;
+    width: 8px; height: 8px; background: #e94560; border-radius: 2px;
+  }
+
+  /* Right sidebar: participants + QA timeline */
+  #side {
+    display: flex; flex-direction: column; gap: 12px;
+    overflow: hidden; min-height: 0;
+  }
+  #side .panel {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid #1a2245;
+    border-radius: 12px;
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+  #side .panel h3 {
+    padding: 10px 14px;
+    font-size: 0.78em;
+    color: #98a0c0;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  #side .panel h3 .count {
+    color: #e94560; font-weight: 600; font-size: 1em;
+  }
+  #side #participants { flex: 0 0 auto; max-height: 32%; }
+  #side #participants .body {
+    overflow-y: auto;
+    padding: 8px 10px;
+  }
+  .user-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 6px 4px;
+    border-radius: 6px;
+  }
+  .user-row .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #5ad08b; box-shadow: 0 0 8px #5ad08b;
+    flex-shrink: 0;
+    margin-top: 6px;
+  }
+  .user-row.offline .dot {
+    background: #4a5878; box-shadow: none;
+  }
+  .user-row .name-wrap {
+    display: flex; flex-direction: column; min-width: 0;
+  }
+  .user-row .name {
+    color: #d8dde8; font-size: 0.92em; line-height: 1.2;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .user-row .name-sub {
+    color: #6a7392; font-size: 0.76em; line-height: 1.3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .user-row.me { background: rgba(233,69,96,0.12); }
+
+  #side #qa-list { flex: 1 1 auto; min-height: 0; }
+  #side #qa-list .body {
+    overflow-y: auto;
+    padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .qa-item {
+    background: #11192e;
+    border: 1px solid #1a2245;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 0.88em;
+    line-height: 1.45;
+  }
+  .qa-item .meta {
+    color: #8a93b0; font-size: 0.78em;
+    margin-bottom: 4px;
+    display: flex; gap: 6px; align-items: baseline;
+  }
+  .qa-item .meta .who { color: #cfd5e6; font-weight: 600; }
+  .qa-item .q { color: #f0a8b6; margin-bottom: 4px; }
+  .qa-item .q:before { content: "Q "; color: #e94560; font-weight: 700; }
+  .qa-item .a { color: #d5d8e8; }
+  .qa-item .a:before { content: "A "; color: #5ad08b; font-weight: 700; }
+  .qa-item.empty { color: #5a6280; text-align: center; padding: 20px; }
+
+  footer {
+    padding: 12px 16px;
+    background: rgba(0,0,0,0.4);
+    border-top: 1px solid rgba(255,255,255,0.06);
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  }
+  footer button {
+    padding: 8px 14px;
+    border-radius: 8px; border: 1px solid #2a3a5a;
+    background: #1e2a4a; color: #e0e0e0; cursor: pointer; font-size: 0.95em;
+  }
+  footer button:hover { background: #2a3a5a; }
+  footer button:disabled { opacity: 0.4; cursor: not-allowed; }
+  footer button.primary { background: #e94560; border-color: #e94560; color: #fff; }
+  footer button.primary:hover { background: #c73650; }
+  footer input {
+    flex: 1; min-width: 160px;
+    padding: 8px 12px;
+    border-radius: 8px; border: 1px solid #2a3a5a;
+    background: #11192e; color: #e0e0e0;
+  }
+  footer input:focus { outline: none; border-color: #e94560; }
+  footer select {
+    padding: 8px 12px;
+    border-radius: 8px; border: 1px solid #2a3a5a;
+    background: #11192e; color: #e0e0e0; font-size: 0.9em;
+    cursor: pointer; max-width: 220px;
+  }
+  footer select:focus { outline: none; border-color: #e94560; }
+  footer select:disabled { opacity: 0.5; cursor: not-allowed; }
+  footer .status {
+    font-size: 0.82em; color: #98a0c0; margin-left: auto;
+  }
+
+  /* Slide iframe replaces the bullet list once a generated deck is loaded.
+     The iframe captures arrow keys for native page navigation. */
+  #slide-frame {
+    flex: 1; width: 100%; border: 0;
+    background: #fff; border-radius: 6px;
+    display: none;
+  }
+  #slide.has-frame .page-num,
+  #slide.has-frame h2,
+  #slide.has-frame ul { display: none; }
+  #slide.has-frame { padding: 0; overflow: hidden; }
+  #slide.has-frame #slide-frame { display: block; flex: 1 1 auto; min-height: 0; }
+
+  /* Per-slide speaker script preview shown beneath the iframe. The model
+     emits one TTS unit per non-empty line; we cap visible height to ~10
+     lines and let overflow scroll. The line currently being spoken gets
+     highlighted so the user can follow along. */
+  #script-pane {
+    display: none;
+    flex: 0 0 auto;
+    max-height: 11em;       /* roughly 10 lines + heading */
+    overflow-y: auto;
+    background: #0b1124;
+    border-top: 1px solid #1a2245;
+    padding: 8px 14px 10px;
+    color: #cfd5e6;
+    font-size: 0.88em;
+    line-height: 1.45;
+  }
+  #slide.has-frame #script-pane { display: block; }
+  #script-pane .meta {
+    color: #98a0c0;
+    font-size: 0.78em;
+    margin-bottom: 4px;
+    display: flex; gap: 8px; align-items: baseline;
+  }
+  #script-pane .meta .idx { color: #e94560; font-weight: 600; }
+  #script-pane .line {
+    padding: 2px 6px;
+    border-left: 2px solid transparent;
+    border-radius: 2px;
+  }
+  #script-pane .line.active {
+    background: rgba(233, 69, 96, 0.15);
+    border-left-color: #e94560;
+    color: #f5f5fa;
+  }
+  #script-pane .empty { color: #5a6280; font-style: italic; }
+
+  /* Upload progress modal — floats over the layout while generation runs. */
+  #upload-overlay {
+    position: fixed; inset: 0;
+    background: rgba(5,8,20,0.78);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    z-index: 200;
+    display: none;
+    align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  #upload-overlay.show { display: flex; }
+  #upload-overlay .panel {
+    background: #11192e;
+    border: 1px solid #2a3a5a;
+    border-radius: 12px;
+    width: min(680px, 100%);
+    max-height: 80vh;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  #upload-overlay h3 {
+    padding: 14px 18px;
+    color: #f5f5fa; font-size: 1.05em;
+    border-bottom: 1px solid #1a2245;
+    display: flex; align-items: center; gap: 10px;
+  }
+  #upload-overlay h3 .stage {
+    margin-left: auto;
+    font-size: 0.78em; color: #98a0c0;
+    font-weight: 400;
+  }
+  /* Spinner shown next to the stage label while the job is queued/running.
+     Hidden once the job lands on done/error. */
+  .spinner {
+    width: 14px; height: 14px;
+    border: 2px solid rgba(255,255,255,0.18);
+    border-top-color: #e94560;
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+    flex-shrink: 0;
+  }
+  .spinner.lg { width: 20px; height: 20px; border-width: 3px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* Persistent footer indicator so the user sees the job is still running
+     after closing the modal. */
+  #upload-indicator {
+    display: none;
+    align-items: center; gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid #2a3a5a; border-radius: 16px;
+    background: #11192e; color: #cfd5e6;
+    font-size: 0.82em;
+    cursor: pointer;
+  }
+  #upload-indicator.show { display: inline-flex; }
+  #upload-indicator:hover { border-color: #e94560; }
+  /* Center loader the slide panel switches to while generation runs. */
+  #slide.is-generating .page-num,
+  #slide.is-generating h2,
+  #slide.is-generating ul { display: none; }
+  #slide-loader {
+    display: none;
+    flex: 1;
+    align-items: center; justify-content: center;
+    flex-direction: column; gap: 14px;
+    color: #cfd5e6; font-size: 0.95em; line-height: 1.6;
+    text-align: center;
+  }
+  #slide.is-generating #slide-loader { display: flex; }
+  #slide.is-generating { align-items: stretch; }
+  #upload-overlay h3 .stage.error { color: #e94560; }
+  #upload-overlay h3 .stage.done  { color: #5ad08b; }
+  #upload-overlay .filename {
+    padding: 6px 18px; color: #98a0c0; font-size: 0.85em;
+    border-bottom: 1px solid #1a2245;
+  }
+  #upload-overlay pre {
+    margin: 0; padding: 12px 18px;
+    flex: 1; overflow-y: auto;
+    font-family: 'SFMono-Regular', Consolas, monospace;
+    font-size: 0.78em; line-height: 1.5;
+    color: #cfd5e6; background: #0b1124;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #upload-overlay .actions {
+    padding: 10px 16px;
+    border-top: 1px solid #1a2245;
+    display: flex; gap: 8px; justify-content: flex-end;
+  }
+  #upload-overlay button {
+    padding: 6px 14px;
+    border-radius: 6px; border: 1px solid #2a3a5a;
+    background: #1e2a4a; color: #e0e0e0; cursor: pointer; font-size: 0.9em;
+  }
+  #upload-overlay button:hover { background: #2a3a5a; }
+  #upload-overlay button.primary {
+    background: #e94560; border-color: #e94560; color: #fff;
+  }
+  #upload-overlay button.primary:hover { background: #c73650; }
+  #upload-overlay button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+<header>
+  <h1 id="talk-title">= = = =</h1>
+  <div class="meta"><span id="presenter"></span><span id="venue-sep" hidden> &middot; </span><span id="venue"></span></div>
+</header>
+
+<main>
+  <div id="avatar">
+    <div class="bg-color"></div>
+    <div class="bg-pattern p1"></div>
+    <div class="bg-pattern p2"></div>
+    <div class="bg-pattern p3"></div>
+    <div class="bg-pattern p4"></div>
+    <div class="speaking-dot"></div>
+  </div>
+  <section id="slide">
+    <div class="page-num" id="page-num">= = = =</div>
+    <h2 id="slide-title">= = = =</h2>
+    <ul id="slide-bullets"></ul>
+    <div id="slide-loader">
+      <div class="spinner lg"></div>
+      <div id="slide-loader-msg">ただいま処理中です…<br><span style="color:#98a0c0;font-size:0.85em">論文からスライドを生成しています（数分かかります）</span></div>
+    </div>
+    <iframe id="slide-frame" title="generated slides"></iframe>
+    <div id="script-pane">
+      <div class="meta"><span class="idx" id="script-idx">—</span><span id="script-title"></span><span style="margin-left:auto;color:#5a6280" id="script-progress"></span></div>
+      <div id="script-lines"><div class="empty">スピーカーノートはまだありません。</div></div>
+    </div>
+  </section>
+
+  <aside id="side">
+    <div class="panel" id="participants">
+      <h3>参加者 <span class="count" id="participants-count">0</span></h3>
+      <div class="body" id="participants-list"></div>
+    </div>
+    <div class="panel" id="qa-list">
+      <h3>質疑応答 <span class="count" id="qa-count">0</span></h3>
+      <div class="body" id="qa-body">
+        <div class="qa-item empty">まだ質問はありません。</div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <button id="btn-prev" disabled>← 前</button>
+  <button id="btn-speak" class="primary" disabled>Speak</button>
+  <button id="btn-next" disabled>次 →</button>
+  <input id="qa-input" placeholder="質疑応答（質問を入力してEnter）" disabled />
+  <button id="btn-ask" disabled>Ask</button>
+  <button id="btn-end" disabled>End</button>
+  <button id="btn-upload" title="論文PDFをアップロードしてスライド生成" disabled>論文アップロード</button>
+  <select id="paper-library" title="アップロード済み論文から選択">
+    <option value="">アップロード済み論文…</option>
+  </select>
+  <button id="btn-paper-apply" title="選択した論文を適用" disabled>適用</button>
+  <button id="btn-paper-delete" title="選択した論文を削除" disabled>削除</button>
+  <span id="upload-indicator" title="生成中のジョブを表示"><span class="spinner"></span><span id="upload-indicator-text">処理中…</span></span>
+  <input type="file" id="file-paper" accept="application/pdf" hidden />
+  <div class="status" id="status">idle</div>
+  <button id="btn-logout" title="サインアウト">ログアウト</button>
+</footer>
+
+<div id="upload-overlay">
+  <div class="panel">
+    <h3>論文 → スライド生成<span class="spinner" id="upload-spinner"></span><span class="stage" id="upload-stage">準備中</span></h3>
+    <div class="filename" id="upload-filename">—</div>
+    <pre id="upload-log"></pre>
+    <div class="actions">
+      <button id="upload-close" disabled>閉じる</button>
+      <button id="upload-apply" class="primary" disabled>このスライドを使う</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/js/professor.js"></script>
+</body>
+</html>

@@ -6,4 +6,6 @@ __pycache__
 node_modules/
 *.log
 nanny_data/
+professor_data/
 venv312/
+.custom-auth.txt
