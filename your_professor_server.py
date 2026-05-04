@@ -138,7 +138,7 @@ custom_allowlist: set[str] = set()
 
 SYSTEM_PROMPT_TEMPLATE = """\
 # 役割
-あなたは D.Sugisawa(杉澤 大輔, mixi.co.jp 所属)本人として、研究発表(LT)をおこなう。
+あなたは {presenter_line}本人として、研究発表(LT)をおこなう。
 聴衆に対して一人称で語り、自分の研究を自分の言葉で説明する。
 出力テキストは TTS で読み上げられ、ブラウザ上の GLB アバターがスライド遷移と
 同期してそれを話している演出となる。
@@ -188,12 +188,31 @@ SYSTEM_PROMPT_TEMPLATE = """\
 - 自分が話していない内容について「先ほど述べたように」と虚構の参照をしない。"""
 
 
-def build_system_prompt(theme: str) -> str:
-    if theme:
-        section = f"\n# 発表テーマ\n「{theme}」\n"
+_DEFAULT_PRESENTER = "D.Sugisawa(杉澤 大輔, mixi.co.jp 所属)"
+
+
+def build_system_prompt(theme: str, presenter: str = "",
+                        affiliation: str = "", venue: str = "") -> str:
+    # -- presenter line ------------------------------------------------
+    if presenter.strip():
+        presenter_line = presenter.strip()
+        if affiliation.strip():
+            presenter_line += f"({affiliation.strip()} 所属)"
     else:
-        section = ""
-    return SYSTEM_PROMPT_TEMPLATE.format(theme_section=section)
+        presenter_line = _DEFAULT_PRESENTER
+    if venue.strip():
+        presenter_line += f"({venue.strip()})"
+
+    # -- theme section -------------------------------------------------
+    if theme:
+        theme_section = f"\n# 発表テーマ\n「{theme}」\n"
+    else:
+        theme_section = ""
+
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        presenter_line=presenter_line,
+        theme_section=theme_section,
+    )
 
 
 # =====================================================================
@@ -269,7 +288,7 @@ _qa_id_counter = 0
 # Active presentation metadata — populated from the most recently uploaded
 # paper. `theme` is injected into the system prompt; `presenter` and
 # `venue` are echoed to the browser header. All cleared on restart.
-current_meta: dict[str, str] = {"theme": "", "presenter": "", "venue": ""}
+current_meta: dict[str, str] = {"theme": "", "presenter": "", "affiliation": "", "venue": ""}
 
 # Paper-upload jobs. Cleared on restart, by design.
 #   upload_jobs[job_id] = {
@@ -861,7 +880,12 @@ def build_prompt_messages(
       5. Last SHORT_TERM_WINDOW history messages (with merge of consecutive
          same-role turns and a skip-notice if history is longer)
     """
-    system_content = build_system_prompt(current_meta.get("theme", ""))
+    system_content = build_system_prompt(
+        theme=current_meta.get("theme", ""),
+        presenter=current_meta.get("presenter", ""),
+        affiliation=current_meta.get("affiliation", ""),
+        venue=current_meta.get("venue", ""),
+    )
 
     system_content += f"\n\n[Stage] {stage}\n"
 
@@ -1639,6 +1663,7 @@ def _meta_to_header(essence: dict[str, str]) -> dict[str, str]:
         venue_parts.append(essence["所属"])
     return {
         "presenter": presenter,
+        "affiliation": essence.get("所属") or "",
         "venue": " · ".join(p for p in venue_parts if p),
     }
 
@@ -2157,17 +2182,20 @@ async def _run_slide_generation(job_id: str):
         meta_update = {
             "theme": theme,
             "presenter": header.get("presenter", ""),
+            "affiliation": header.get("affiliation", ""),
             "venue": header.get("venue", ""),
         }
         job["theme"] = theme
         job["presenter"] = meta_update["presenter"]
+        job["affiliation"] = meta_update["affiliation"]
         job["venue"] = meta_update["venue"]
         if theme or meta_update["presenter"] or meta_update["venue"]:
             global current_meta
             current_meta = meta_update
             job["log"].append(
-                "[done] meta theme={!r} presenter={!r} venue={!r}".format(
-                    meta_update["theme"], meta_update["presenter"], meta_update["venue"],
+                "[done] meta theme={!r} presenter={!r} affiliation={!r} venue={!r}".format(
+                    meta_update["theme"], meta_update["presenter"],
+                    meta_update["affiliation"], meta_update["venue"],
                 )
             )
         job["log"].append(f"[done] html={dest_html.name} ({dest_html.stat().st_size} bytes)")
@@ -2477,6 +2505,7 @@ def _rehydrate_papers_from_disk() -> int:
             "script_slides": _parse_script_md(script),
             "theme": theme,
             "presenter": header.get("presenter", ""),
+            "affiliation": header.get("affiliation", ""),
             "venue": header.get("venue", ""),
             "error": None,
         }
@@ -2499,6 +2528,7 @@ async def list_uploaded_papers(_uid: str = Depends(require_auth)):
             "filename": job.get("filename") or "",
             "theme": job.get("theme") or "",
             "presenter": job.get("presenter") or "",
+            "affiliation": job.get("affiliation") or "",
             "venue": job.get("venue") or "",
             "modified_at": job.get("finished_at"),
             "slides": len(job.get("script_slides") or []),
@@ -2540,7 +2570,7 @@ async def delete_uploaded_paper(job_id: str, uid: str = Depends(require_remove_t
             and current_meta.get("presenter") == (job.get("presenter") or "")
             and current_meta.get("venue") == (job.get("venue") or "")
             and current_meta.get("theme")):
-        current_meta = {"theme": "", "presenter": "", "venue": ""}
+        current_meta = {"theme": "", "presenter": "", "affiliation": "", "venue": ""}
     return {"job_id": job_id, "deleted": True}
 
 
@@ -2557,6 +2587,7 @@ async def select_uploaded_paper(job_id: str, _uid: str = Depends(require_auth)):
     current_meta = {
         "theme": job.get("theme") or "",
         "presenter": job.get("presenter") or "",
+        "affiliation": job.get("affiliation") or "",
         "venue": job.get("venue") or "",
     }
     return {
@@ -2564,6 +2595,7 @@ async def select_uploaded_paper(job_id: str, _uid: str = Depends(require_auth)):
         "filename": job.get("filename") or "",
         "theme": current_meta["theme"],
         "presenter": current_meta["presenter"],
+        "affiliation": current_meta["affiliation"],
         "venue": current_meta["venue"],
     }
 
