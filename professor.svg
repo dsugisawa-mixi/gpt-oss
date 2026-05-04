@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 880" font-family="'Helvetica Neue', Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrow-amber" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#06b6d4"/>
+    </marker>
+    <marker id="arrow-cyan-up" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto-start-reverse">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#06b6d4"/>
+    </marker>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="880" rx="12" fill="url(#bg)"/>
+
+  <!-- ============ Browser ============ -->
+  <rect x="40" y="20" width="880" height="120" rx="10" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="60" y="42" font-weight="bold" fill="#1e40af" font-size="14">Browser</text>
+  <text x="155" y="42" fill="#475569" font-size="11">(professor.html / professor.js / auth.js)</text>
+
+  <rect x="65"  y="55" width="170" height="68" rx="8" fill="#fff" stroke="#93c5fd"/>
+  <text x="150" y="82" text-anchor="middle" font-weight="600" fill="#1e3a5f">3D Avatar</text>
+  <text x="150" y="100" text-anchor="middle" fill="#64748b" font-size="11">(Three.js)</text>
+
+  <rect x="255" y="55" width="170" height="68" rx="8" fill="#fff" stroke="#93c5fd"/>
+  <text x="340" y="82" text-anchor="middle" font-weight="600" fill="#1e3a5f">Slide View</text>
+  <text x="340" y="100" text-anchor="middle" fill="#64748b" font-size="11">(deck / iframe)</text>
+
+  <rect x="455" y="55" width="170" height="68" rx="8" fill="#fff" stroke="#93c5fd"/>
+  <text x="540" y="82" text-anchor="middle" font-weight="600" fill="#1e3a5f">Q&amp;A / Chat</text>
+  <text x="540" y="100" text-anchor="middle" fill="#64748b" font-size="11">Timeline</text>
+
+  <rect x="645" y="55" width="250" height="68" rx="8" fill="#fff" stroke="#93c5fd"/>
+  <text x="770" y="82" text-anchor="middle" font-weight="600" fill="#1e3a5f">Paper Upload</text>
+  <text x="770" y="100" text-anchor="middle" fill="#64748b" font-size="11">Modal</text>
+
+  <!-- Arrow: Browser -> Proxy -->
+  <line x1="480" y1="140" x2="480" y2="170" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <text x="492" y="160" fill="#3b82f6" font-size="10" font-weight="600">HTTPS + X-Operator-ID</text>
+
+  <!-- ============ AWS Proxy ============ -->
+  <rect x="40" y="175" width="880" height="75" rx="10" fill="#cffafe" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="60" y="197" font-weight="bold" fill="#0e7490" font-size="14">proxy_server.py</text>
+  <text x="215" y="197" fill="#475569" font-size="11">(AWS ELB / EC2)</text>
+
+  <rect x="65"  y="207" width="220" height="32" rx="6" fill="#fff" stroke="#22d3ee"/>
+  <text x="175" y="228" text-anchor="middle" font-weight="600" fill="#155e75" font-size="11">HTTP Relay (Future-based)</text>
+
+  <rect x="305" y="207" width="220" height="32" rx="6" fill="#fff" stroke="#22d3ee"/>
+  <text x="415" y="228" text-anchor="middle" font-weight="600" fill="#155e75" font-size="11">Stream Relay (Queue/Channel)</text>
+
+  <rect x="545" y="207" width="170" height="32" rx="6" fill="#fff" stroke="#22d3ee"/>
+  <text x="630" y="228" text-anchor="middle" font-weight="600" fill="#155e75" font-size="11">/api/tunnel/info</text>
+
+  <rect x="735" y="207" width="160" height="32" rx="6" fill="#fff" stroke="#22d3ee"/>
+  <text x="815" y="228" text-anchor="middle" font-weight="600" fill="#155e75" font-size="11">Tunnel Registry</text>
+
+  <!-- Arrow: Proxy <-> Tunnel Client (WebSocket, outbound from NAT) -->
+  <line x1="480" y1="250" x2="480" y2="280" stroke="#06b6d4" stroke-width="2" stroke-dasharray="6,3" marker-end="url(#arrow-cyan)"/>
+  <text x="492" y="270" fill="#0e7490" font-size="10" font-weight="600">WebSocket Tunnel</text>
+
+  <!-- ============ NAT boundary ============ -->
+  <line x1="40" y1="286" x2="920" y2="286" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,4"/>
+  <text x="60" y="298" fill="#94a3b8" font-size="10" font-style="italic">NAT Boundary (tunnel_client.py connects outbound)</text>
+
+  <!-- ============ Tunnel Client ============ -->
+  <rect x="340" y="305" width="280" height="40" rx="8" fill="#e0f2fe" stroke="#0ea5e9" stroke-width="1.5"/>
+  <text x="480" y="330" text-anchor="middle" font-weight="bold" fill="#0c4a6e" font-size="12">tunnel_client.py</text>
+
+  <!-- Arrow: Tunnel Client -> Server -->
+  <line x1="480" y1="345" x2="480" y2="370" stroke="#06b6d4" stroke-width="2" marker-end="url(#arrow-cyan)"/>
+  <text x="492" y="363" fill="#0e7490" font-size="10" font-weight="600">localhost HTTP</text>
+
+  <!-- ============ Server ============ -->
+  <rect x="40" y="375" width="880" height="320" rx="10" fill="#fef9c3" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="60" y="397" font-weight="bold" fill="#92400e" font-size="14">your_professor_server.py</text>
+  <text x="290" y="397" fill="#78716c" font-size="11">(FastAPI)</text>
+
+  <!-- Row 1: 4 modules -->
+  <rect x="65"  y="410" width="170" height="55" rx="8" fill="#fff" stroke="#fbbf24"/>
+  <text x="150" y="433" text-anchor="middle" font-weight="600" fill="#78350f">Chat API</text>
+  <text x="150" y="450" text-anchor="middle" fill="#64748b" font-size="11">(vLLM)</text>
+
+  <rect x="255" y="410" width="170" height="55" rx="8" fill="#fff" stroke="#fbbf24"/>
+  <text x="340" y="438" text-anchor="middle" font-weight="600" fill="#78350f">Auth / Session</text>
+
+  <rect x="445" y="410" width="185" height="55" rx="8" fill="#fff" stroke="#fbbf24"/>
+  <text x="537" y="438" text-anchor="middle" font-weight="600" fill="#78350f">Upload Pipeline</text>
+
+  <rect x="650" y="410" width="245" height="55" rx="8" fill="#fff" stroke="#fbbf24"/>
+  <text x="772" y="433" text-anchor="middle" font-weight="600" fill="#78350f">Presence / QA</text>
+  <text x="772" y="450" text-anchor="middle" fill="#64748b" font-size="11">Timeline</text>
+
+  <!-- Row 2: paper_rag + Subprocess Pipeline -->
+  <rect x="65"  y="505" width="170" height="55" rx="8" fill="#ecfdf5" stroke="#34d399"/>
+  <text x="150" y="533" text-anchor="middle" font-weight="600" fill="#065f46">paper_rag.py</text>
+  <text x="150" y="548" text-anchor="middle" fill="#64748b" font-size="10">Qwen3-Embedding + LanceDB</text>
+
+  <rect x="445" y="505" width="450" height="55" rx="8" fill="#fce7f3" stroke="#f472b6"/>
+  <text x="670" y="528" text-anchor="middle" font-weight="600" fill="#831843">Subprocess Pipeline</text>
+  <text x="670" y="545" text-anchor="middle" fill="#64748b" font-size="10">generate_slides.py / html2pdf.mjs / generate_scripts.py</text>
+
+  <!-- Row 3: build_paper_index -->
+  <rect x="65"  y="600" width="400" height="55" rx="8" fill="#f0fdf4" stroke="#4ade80"/>
+  <text x="265" y="628" text-anchor="middle" font-weight="600" fill="#14532d">build_paper_index.py</text>
+  <text x="265" y="643" text-anchor="middle" fill="#64748b" font-size="10">Discover / Chunk / Embed / LanceDB Persist</text>
+
+  <!-- Internal arrows -->
+  <line x1="150" y1="465" x2="150" y2="500" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="537" y1="465" x2="537" y2="500" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="150" y1="560" x2="150" y2="595" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <path d="M 537,560 L 537,585 L 470,585 L 470,620" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6,3" fill="none" marker-end="url(#arrow-amber)"/>
+  <text x="495" y="580" fill="#b45309" font-size="10" font-weight="600">rebuild</text>
+
+  <!-- ============ External Services ============ -->
+  <!-- vLLM -->
+  <rect x="40" y="730" width="200" height="60" rx="10" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="140" y="755" text-anchor="middle" font-weight="bold" fill="#5b21b6">vLLM</text>
+  <text x="140" y="773" text-anchor="middle" fill="#64748b" font-size="11">(gpt-oss-20b)</text>
+
+  <!-- TTS -->
+  <rect x="260" y="730" width="200" height="60" rx="10" fill="#fce4ec" stroke="#e57373" stroke-width="1.5"/>
+  <text x="360" y="755" text-anchor="middle" font-weight="bold" fill="#b71c1c">TTS Backend</text>
+  <text x="360" y="773" text-anchor="middle" fill="#64748b" font-size="11">(PCM streaming)</text>
+
+  <!-- S3 -->
+  <rect x="720" y="730" width="200" height="60" rx="10" fill="#fff3e0" stroke="#ff9800" stroke-width="1.5"/>
+  <text x="820" y="755" text-anchor="middle" font-weight="bold" fill="#e65100">S3</text>
+  <text x="820" y="773" text-anchor="middle" fill="#64748b" font-size="11">(PDF保存)</text>
+
+  <!-- Arrows to externals -->
+  <line x1="140" y1="695" x2="140" y2="725" stroke="#8b5cf6" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="360" y1="695" x2="360" y2="725" stroke="#e57373" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="820" y1="695" x2="820" y2="725" stroke="#ff9800" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Legend -->
+  <rect x="500" y="810" width="420" height="55" rx="8" fill="#fff" stroke="#cbd5e1" stroke-width="1"/>
+  <line x1="520" y1="830" x2="560" y2="830" stroke="#06b6d4" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="570" y="834" fill="#475569" font-size="10">WebSocket Tunnel (NAT outbound)</text>
+  <line x1="520" y1="850" x2="560" y2="850" stroke="#3b82f6" stroke-width="2"/>
+  <text x="570" y="854" fill="#475569" font-size="10">HTTPS (Browser to Proxy)</text>
+  <line x1="730" y1="830" x2="770" y2="830" stroke="#06b6d4" stroke-width="2"/>
+  <text x="780" y="834" fill="#475569" font-size="10">localhost HTTP</text>
+  <line x1="730" y1="850" x2="770" y2="850" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="780" y="854" fill="#475569" font-size="10">async rebuild</text>
+</svg>
