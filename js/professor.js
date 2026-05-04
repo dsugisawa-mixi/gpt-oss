@@ -93,6 +93,10 @@ const state = {
   qaInFlight: false,      // a QA exchange (LLM reply + its TTS) is being
                           // played — Speak is locked so the audience can't
                           // interrupt the answer with another hand-raise.
+  currentLabId: null,     // Lab whose paper is currently applied. Drives
+                          // single-target chat for non-qa stages so the LT
+                          // narration stays on the originating backend even
+                          // when other Labs are also toggled ON for Q&A.
 };
 
 function setStatus(s) { elStatus.textContent = s; }
@@ -195,10 +199,23 @@ async function apiGet(path) {
   return r.json();
 }
 
-async function chat({ stage, slide = null, message = "" }) {
+// activeLabForStage(stage): which Lab to send a non-qa-fanout chat to.
+// Priority: the Lab that owns the currently-applied paper (state.currentLabId,
+// set by applyPaperById) so presenter narration stays on the right backend.
+// Falls back to the single selected Lab when nothing applied yet, else null
+// (no Lab selected → proxy default routing, which is fine for boot calls).
+function activeLabForStage(_stage) {
+  if (state.currentLabId && labState.selectedLabIds.has(state.currentLabId)) {
+    return state.currentLabId;
+  }
+  return singleSelectedLab();
+}
+
+async function chat({ stage, slide = null, message = "", operatorId = null }) {
+  const opId = operatorId ?? activeLabForStage(stage);
   const body = { user_id: USER_ID, stage, message };
   if (slide) body.slide = slide;
-  const r = await fetch("/api/chat", {
+  const r = await fetch(withLab("/api/chat", opId), {
     method: "POST",
     headers: getAuthHeaders(USER_ID),
     body: JSON.stringify(body),
@@ -826,12 +843,68 @@ async function runAutoProgress() {
 // ---------- presence + qa timeline ----------
 const POLL_INTERVAL_MS = 10_000;
 let pollTimer = null;
-let lastQaId = 0;
+// Per-Lab cursor: each Lab assigns qa_ids independently, so a single
+// global cursor would skip items from late-joining Labs. Cleared by
+// toggleLab so a freshly-selected Lab pulls from 0.
+const lastQaIdByLab = {};
 
 const elParticipantsList = document.getElementById("participants-list");
 const elParticipantsCount = document.getElementById("participants-count");
 const elQaBody = document.getElementById("qa-body");
 const elQaCount = document.getElementById("qa-count");
+const elLabsList = document.getElementById("labs-list");
+const elLabsCount = document.getElementById("labs-count");
+
+// Multi-lab fan-out: the user can toggle multiple Labs ON. Paper library
+// fans out to each selected Lab in parallel and groups results by Lab in
+// the dropdown. Upload requires exactly one selected Lab so the target is
+// unambiguous. labels[] caches lab display names so groups stay labeled
+// even if the dropdown is rendered before the next refreshLabs tick.
+const labState = {
+  selectedLabIds: new Set(),
+  labels: {},   // operator_id -> human label
+};
+
+// Append operator_id=<id> to a /api/* path so the proxy routes the request
+// to that Lab's tunnel. Pass the operator_id explicitly — callers either
+// know which Lab (per-paper-row actions) or use singleSelectedLab() for
+// upload-style "one-target" calls.
+function withLab(path, operatorId) {
+  if (!operatorId) return path;
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}operator_id=${encodeURIComponent(operatorId)}`;
+}
+
+// Returns the single selected Lab id, or null if 0 or >1 are selected.
+// Used by the upload flow which can't disambiguate which Lab to target.
+function singleSelectedLab() {
+  return labState.selectedLabIds.size === 1
+    ? Array.from(labState.selectedLabIds)[0]
+    : null;
+}
+
+// Encode/decode the dropdown's option value. Each option carries both the
+// owning Lab and the job_id so the apply/delete handlers can route
+// per-paper rather than per-(globally selected)-Lab.
+const PAPER_KEY_SEP = "|";
+function paperKey(operatorId, jobId) { return `${operatorId}${PAPER_KEY_SEP}${jobId}`; }
+function parsePaperKey(value) {
+  if (!value) return null;
+  const idx = value.indexOf(PAPER_KEY_SEP);
+  if (idx < 0) return null;
+  return { operator_id: value.slice(0, idx), job_id: value.slice(idx + 1) };
+}
+
+// Hamburger accordion: toggles `.collapsed` on the parent .panel.
+// Default state lives in the HTML class list (panels start collapsed).
+for (const panel of document.querySelectorAll("#side .panel[data-collapsible]")) {
+  const ham = panel.querySelector("h3 .ham");
+  if (!ham) continue;
+  ham.addEventListener("click", () => {
+    const nowCollapsed = panel.classList.toggle("collapsed");
+    ham.setAttribute("aria-expanded", String(!nowCollapsed));
+  });
+}
 
 async function heartbeat() {
   try {
@@ -879,53 +952,241 @@ async function refreshParticipants() {
   }
 }
 
+function renderQaItem(item) {
+  // item is one Lab's QA record, decorated with _opId by refreshQaTimeline.
+  const div = document.createElement("div");
+  div.className = "qa-item";
+  // Composite key: qa_id is per-Lab so we prefix with the Lab id to keep
+  // the dataset key globally unique within the merged DOM.
+  div.dataset.qaId = `${item._opId}:${item.qa_id}`;
+  div.dataset.opId = item._opId || "";
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const labLabel = labState.labels[item._opId] || (item._opId || "").slice(0, 6) || "Lab";
+  const badge = document.createElement("span");
+  badge.className = "lab-badge";
+  badge.textContent = labLabel;
+  badge.title = `Lab: ${labLabel}`;
+  const who = document.createElement("span"); who.className = "who";
+  who.textContent = item.display_name;
+  const when = document.createElement("span");
+  when.textContent = new Date(item.ts * 1000).toLocaleTimeString();
+  meta.append(badge, who, when);
+  if (item.slide_page) {
+    const sp = document.createElement("span"); sp.textContent = `slide ${item.slide_page}`;
+    meta.append(sp);
+  }
+  // Accuracy badge: server packs {rag_hits, top_score, mean_score}. We
+  // surface mean_score (overall match) + hits count; top_score lives in
+  // the tooltip for users who care about the strongest grounding chunk.
+  const acc = item.accuracy || {};
+  if (acc.rag_hits || acc.mean_score) {
+    const ab = document.createElement("span");
+    ab.className = "acc-badge";
+    const mean = (acc.mean_score || 0).toFixed(2);
+    ab.textContent = `🎯 ${mean} / ${acc.rag_hits || 0}`;
+    ab.title = `mean_score=${(acc.mean_score || 0).toFixed(3)}, top_score=${(acc.top_score || 0).toFixed(3)}, hits=${acc.rag_hits || 0}`;
+    meta.append(ab);
+  }
+  // Per-item Speak: only the user-clicked answer plays via TTS, never an
+  // auto-play after fan-out. (Single-Lab path keeps its existing auto-TTS
+  // in btnAsk; this button is the multi-Lab "pick which to speak".)
+  const speakBtn = document.createElement("button");
+  speakBtn.className = "qa-speak";
+  speakBtn.type = "button";
+  speakBtn.textContent = "🔊";
+  speakBtn.title = "この回答を読み上げる";
+  speakBtn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    if (!item.answer) return;
+    speakBtn.disabled = true;
+    try {
+      await unlockAudio();
+      await speak(item.answer, "male");
+    } catch (err) {
+      console.warn("[qa] speak failed:", err.message);
+    } finally {
+      speakBtn.disabled = false;
+    }
+  });
+  meta.append(speakBtn);
+
+  const q = document.createElement("div"); q.className = "q";
+  q.textContent = item.question;
+  const a = document.createElement("div"); a.className = "a";
+  a.textContent = item.answer;
+  div.append(meta, q, a);
+  return div;
+}
+
 async function refreshQaTimeline() {
+  // Per-Lab fan-out + merge by ts. With multi-select, each Lab keeps its
+  // own qa_id sequence and own /api/qa/timeline; the GUI fetches each in
+  // parallel, decorates items with their owning op_id, and inserts them
+  // into the merged DOM in chronological order.
+  const labs = Array.from(labState.selectedLabIds);
+  if (!labs.length) return;
+  const fetched = await Promise.all(labs.map(async (opId) => {
+    try {
+      const start = lastQaIdByLab[opId] || 0;
+      const url = withLab(
+        `/api/qa/timeline?start=${start}&end=-1&limit=50`, opId);
+      const r = await fetch(url, { headers: getAuthHeaders(USER_ID) });
+      if (!r.ok) return [];
+      const data = await r.json();
+      const items = (data.items || []).map((it) => ({ ...it, _opId: opId }));
+      for (const it of items) {
+        lastQaIdByLab[opId] = Math.max(lastQaIdByLab[opId] || 0, it.qa_id);
+      }
+      return items;
+    } catch (e) {
+      console.warn(`[qa] timeline fetch failed for op=${opId}:`, e.message);
+      return [];
+    }
+  }));
+  const allNew = fetched.flat().sort((a, b) => a.ts - b.ts);
+  if (!allNew.length) return;
+  const empty = elQaBody.querySelector(".empty");
+  if (empty) empty.remove();
+  for (const item of allNew) elQaBody.appendChild(renderQaItem(item));
+  elQaBody.scrollTop = elQaBody.scrollHeight;
+  elQaCount.textContent = elQaBody.querySelectorAll(".qa-item:not(.empty)").length;
+}
+
+function _formatTimestamp(unix) {
+  if (!unix) return "—";
+  const d = new Date(unix * 1000);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString();
+}
+
+async function refreshLabs() {
+  // /api/tunnel/info is served directly by the proxy (not forwarded through
+  // the tunnel) — no auth header needed. operator.lab is populated by the
+  // tunnel_client's post-register update_operator push, so a freshly-
+  // connected operator may show "(準備中…)" until its first push lands.
   try {
-    // Server semantics: start = exclusive lower bound on qa_id, end=-1
-    // means open-ended. lastQaId starts at 0 so the first poll requests
-    // everything (qa_id > 0).
-    const url = `/api/qa/timeline?start=${lastQaId}&end=-1&limit=50`;
-    const r = await fetch(url, { headers: getAuthHeaders(USER_ID) });
+    const r = await fetch("/api/tunnel/info");
     if (!r.ok) return;
     const data = await r.json();
-    if (!data.items.length) return;
-    // Replace empty placeholder once we have data
-    const empty = elQaBody.querySelector(".empty");
-    if (empty) empty.remove();
-    for (const item of data.items) {
-      const div = document.createElement("div");
-      div.className = "qa-item";
-      div.dataset.qaId = item.qa_id;
-      const meta = document.createElement("div");
-      meta.className = "meta";
-      const who = document.createElement("span"); who.className = "who";
-      who.textContent = item.display_name;
-      const when = document.createElement("span");
-      when.textContent = new Date(item.ts * 1000).toLocaleTimeString();
-      meta.append(who, when);
-      if (item.slide_page) {
-        const sp = document.createElement("span"); sp.textContent = `slide ${item.slide_page}`;
-        meta.append(sp);
-      }
-      const q = document.createElement("div"); q.className = "q";
-      q.textContent = item.question;
-      const a = document.createElement("div"); a.className = "a";
-      a.textContent = item.answer;
-      div.append(meta, q, a);
-      elQaBody.appendChild(div);
-      lastQaId = Math.max(lastQaId, item.qa_id);
+    const ops = Array.isArray(data.operators) ? data.operators : [];
+    elLabsCount.textContent = ops.length;
+    elLabsList.innerHTML = "";
+
+    // Refresh the label cache so paperLibrary's optgroup labels stay in sync
+    // even if it's rendered between refreshLabs ticks.
+    const newLabels = {};
+    for (const op of ops) {
+      const lab = op.lab || {};
+      newLabels[op.id] = lab.name || lab.lab_id || op.name || op.id?.slice(0, 6) || "Lab";
     }
-    elQaBody.scrollTop = elQaBody.scrollHeight;
-    // Update total count from server-known timeline length: we only know
-    // delta here; track via accumulator on the DOM.
-    elQaCount.textContent = elQaBody.querySelectorAll(".qa-item:not(.empty)").length;
+    labState.labels = newLabels;
+
+    // Drop selections for Labs that disappeared.
+    let dropped = false;
+    for (const id of Array.from(labState.selectedLabIds)) {
+      if (!ops.some((o) => o.id === id)) {
+        labState.selectedLabIds.delete(id);
+        dropped = true;
+      }
+    }
+
+    if (!ops.length) {
+      const empty = document.createElement("div");
+      empty.className = "lab-empty";
+      empty.textContent = "接続中の Lab はありません。";
+      elLabsList.appendChild(empty);
+      if (dropped) refreshPaperLibrary();
+      return;
+    }
+
+    for (const op of ops) {
+      const lab = op.lab || {};
+      const trust = lab.trust || {};
+      const row = document.createElement("div");
+      row.className = "lab-row";
+      const isSel = labState.selectedLabIds.has(op.id);
+      if (isSel) row.classList.add("selected");
+      row.dataset.operatorId = op.id || "";
+      row.tabIndex = 0;
+      row.setAttribute("role", "checkbox");
+      row.setAttribute("aria-checked", String(isSel));
+
+      const head = document.createElement("div");
+      head.className = "lab-head";
+      // ☑/☐ visual to make it obvious this is a multi-select toggle.
+      const check = document.createElement("span");
+      check.className = "lab-check";
+      check.setAttribute("aria-hidden", "true");
+      const dot = document.createElement("div"); dot.className = "lab-dot";
+      const name = document.createElement("span"); name.className = "lab-name";
+      name.textContent = newLabels[op.id];
+      const stats = document.createElement("span"); stats.className = "lab-stats";
+      const papers = trust.papers ?? 0;
+      const chunks = trust.corpus_chunks ?? 0;
+      stats.textContent = `📄 ${papers} / chunks ${chunks.toLocaleString()}`;
+      head.append(check, dot, name, stats);
+
+      const summary = document.createElement("div");
+      summary.className = "lab-summary";
+      summary.textContent = lab.summary || "(準備中…)";
+
+      const meta = document.createElement("div");
+      meta.className = "lab-meta";
+      const updated = _formatTimestamp(trust.last_updated);
+      const model = trust.embed_model || "—";
+      meta.textContent = `index ${updated} · ${model}`;
+
+      row.append(head, summary, meta);
+      const onToggle = () => toggleLab(op.id);
+      row.addEventListener("click", onToggle);
+      row.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onToggle();
+        }
+      });
+      elLabsList.appendChild(row);
+    }
+    if (dropped) refreshPaperLibrary();
   } catch (e) {
-    console.warn("[qa] timeline fetch failed:", e.message);
+    console.warn("[labs] tunnel info fetch failed:", e.message);
   }
 }
 
+// Toggle one Lab's selection ON/OFF. Re-renders the row checkbox state and
+// forces the paper library to refresh from the new selection set (or back
+// to the locked "Lab を選択してください" placeholder when the set is empty).
+function toggleLab(id) {
+  if (!id) return;
+  if (labState.selectedLabIds.has(id)) {
+    labState.selectedLabIds.delete(id);
+  } else {
+    labState.selectedLabIds.add(id);
+  }
+  for (const row of elLabsList.querySelectorAll(".lab-row")) {
+    const sel = labState.selectedLabIds.has(row.dataset.operatorId);
+    row.classList.toggle("selected", sel);
+    row.setAttribute("aria-checked", String(sel));
+  }
+  // QA timeline items are Lab-owned. A selection change can add or remove
+  // visible items, so we wipe the merged DOM + per-Lab cursors and
+  // re-fetch from the new selection set on the next tick.
+  for (const k of Object.keys(lastQaIdByLab)) delete lastQaIdByLab[k];
+  elQaBody.innerHTML = '<div class="qa-item empty">まだ質問はありません。</div>';
+  elQaCount.textContent = "0";
+  refreshPaperLibrary();
+  refreshQaTimeline();
+}
+
 async function pollOnce() {
-  await Promise.all([heartbeat(), refreshParticipants(), refreshQaTimeline()]);
+  await Promise.all([
+    heartbeat(),
+    refreshParticipants(),
+    refreshQaTimeline(),
+    refreshLabs(),
+  ]);
 }
 
 function startPolling() {
@@ -1092,6 +1353,25 @@ btnSpeak.addEventListener("click", async () => {
 
 const QA_RESUME_TRANSITION_PHRASE = "それでは、発表を続けさせていただきます。";
 
+// Multi-Lab QA fan-out: send the question to every selected Lab in parallel,
+// pulling their fresh QA items into the merged timeline. No auto-TTS — the
+// user picks which answer to play via the per-item 🔊 button.
+async function fanOutQa(question, labs) {
+  const slide = currentSlidePayload();
+  setStatus(`asking ${labs.length} labs…`);
+  const results = await Promise.allSettled(labs.map((opId) =>
+    chat({ stage: "qa", slide, message: question, operatorId: opId })
+  ));
+  const ok = results.filter((r) => r.status === "fulfilled").length;
+  const failed = results.length - ok;
+  setStatus(failed
+    ? `asked ${ok}/${labs.length} labs (${failed} failed)`
+    : `asked ${ok}/${labs.length} labs ✓`);
+  // Pull the just-recorded items into the merged timeline immediately so
+  // the user doesn't wait the full 10s poll tick to see answers.
+  await refreshQaTimeline();
+}
+
 btnAsk.addEventListener("click", async () => {
   cancelAuto();
   cancelResume();    // any pending 30s resume belongs to a previous question
@@ -1099,36 +1379,40 @@ btnAsk.addEventListener("click", async () => {
   await unlockAudio();  // user gesture: ensures the AudioContext is live for TTS
   const q = inputQA.value.trim();
   if (!q) return;
+  const labs = Array.from(labState.selectedLabIds);
+  if (!labs.length) {
+    alert("Lab を 1 つ以上選択してください");
+    return;
+  }
   inputQA.value = "";
-  // Lock the Speak (= 挙手) button for the QA TTS reply AND the
-  // transitional phrase that follows, so the audience can't interrupt
-  // mid-flow with another hand-raise. doStage's chat+speak runs first,
-  // then a short bridge phrase ("それでは、発表を続けさせていただきます。")
-  // so the resumed slide narration doesn't slam in cold after the answer.
   state.qaInFlight = true;
   btnSpeak.disabled = true;
   try {
-    await doStage("qa", { message: q });
-    if (state.scriptResumeAt) {
-      // doStage finished with setSpeakActive(false) — restore "✋ 挙手"
-      // for the bridge phrase so the icon stays consistent through the
-      // whole locked window.
-      setSpeakActive(true);
-      try {
-        await speak(QA_RESUME_TRANSITION_PHRASE, "male");
-      } finally {
-        setSpeakActive(false);
+    if (labs.length === 1) {
+      // Single-Lab path: keep auto-TTS + bridge-phrase + slide-resume so
+      // the original LT flow is unchanged when only one Lab is active.
+      await doStage("qa", { message: q });
+      if (state.scriptResumeAt) {
+        setSpeakActive(true);
+        try {
+          await speak(QA_RESUME_TRANSITION_PHRASE, "male");
+        } finally {
+          setSpeakActive(false);
+        }
       }
+    } else {
+      // Multi-Lab compare mode: parallel chat, NO auto-TTS, NO bridge.
+      // The user reads/compares answers in the timeline and clicks a 🔊
+      // on whichever Lab they want to actually hear spoken.
+      await fanOutQa(q, labs);
     }
   } finally {
     state.qaInFlight = false;
     btnSpeak.disabled = false;
   }
-  // Now resume the slide. btnSpeak.click() routes through the play branch
-  // and starts speakScriptForIndex from scriptResumeAt.lineIdx; its
-  // synchronous setSpeakActive(true) flips the icon back to "✋ 挙手"
-  // before the next paint, so there's no ▶ Speak flicker.
-  if (state.scriptResumeAt) {
+  // Auto-resume the slide narration only on the single-Lab path (the
+  // multi-Lab compare flow has no concept of "the answer" to bridge from).
+  if (labs.length === 1 && state.scriptResumeAt) {
     btnSpeak.click();
   }
 });
@@ -1203,6 +1487,10 @@ btnLogout.addEventListener("click", async () => {
 
 const uploadState = {
   jobId: null,
+  // Lab the upload was started against. All subsequent job-status / slide
+  // fetches must reuse this operator_id, even if the user toggles other
+  // Labs ON/OFF mid-flight, so they keep talking to the right backend.
+  operatorId: null,
   polling: null,
   status: null,    // awaiting_upload | queued | downloading | running | done | error
   filename: "",
@@ -1314,11 +1602,11 @@ function fitIframeToContainer() {
   }
 }
 
-async function applyGeneratedSlides(jobId) {
+async function applyGeneratedSlides(operatorId, jobId) {
   // iframes don't carry custom HTTP headers, so the slides endpoint can't
   // see X-User-Id when set via src=URL — it'd 401. Fetch the HTML manually
   // with auth headers and inject it via srcdoc.
-  const url = `/api/upload/jobs/${encodeURIComponent(jobId)}/slides`;
+  const url = withLab(`/api/upload/jobs/${encodeURIComponent(jobId)}/slides`, operatorId);
   let html;
   try {
     const r = await fetch(url, { headers: getAuthHeaders(USER_ID) });
@@ -1363,9 +1651,9 @@ async function applyGeneratedSlides(jobId) {
   // Pull the per-slide speaker script (best-effort — the iframe still
   // works without it, just falls back to the LLM chat call).
   try {
-    const r = await fetch(`/api/upload/jobs/${encodeURIComponent(jobId)}/script`, {
-      headers: getAuthHeaders(USER_ID),
-    });
+    const r = await fetch(
+      withLab(`/api/upload/jobs/${encodeURIComponent(jobId)}/script`, operatorId),
+      { headers: getAuthHeaders(USER_ID) });
     if (r.ok) {
       const data = await r.json();
       state.scriptSlides = Array.isArray(data.slides) ? data.slides : null;
@@ -1534,7 +1822,9 @@ function scheduleResume() {
 
 async function pollUploadJob(jobId) {
   try {
-    const url = `/api/upload/jobs/${encodeURIComponent(jobId)}?since=${uploadState.logOffset || 0}`;
+    const url = withLab(
+      `/api/upload/jobs/${encodeURIComponent(jobId)}?since=${uploadState.logOffset || 0}`,
+      uploadState.operatorId);
     const r = await fetch(url, {
       headers: getAuthHeaders(USER_ID),
     });
@@ -1571,10 +1861,10 @@ async function pollUploadJob(jobId) {
       });
       // Auto-swap the slide panel from the loader to the generated deck
       // so the user doesn't have to click anything to see it.
-      applyGeneratedSlides(jobId);
+      applyGeneratedSlides(uploadState.operatorId, jobId);
       // Pull the new paper into the dropdown so the user can re-select
       // it later without re-uploading.
-      refreshPaperLibrary(jobId);
+      refreshPaperLibrary(paperKey(uploadState.operatorId, jobId));
     } else if (data.status === "error") {
       setUploadStage("失敗", "error");
       setUploadIndicator(false);
@@ -1621,7 +1911,9 @@ function stopUploadPolling() {
 // per-selection updater (updatePaperButtons) re-applies both
 // constraints without needing to re-fetch eligibility.
 function applyEligibility({ upload = false, remove = false } = {}) {
-  btnUpload.disabled = !upload;
+  // Stash both ticket flags on dataset so updatePaperButtons can reapply
+  // the (lab-selected ∧ ticket-ok) gate after Lab selection changes too.
+  btnUpload.dataset.ticketOk = upload ? "1" : "";
   btnUpload.title = upload
     ? "論文PDFをアップロードしてスライド生成"
     : "論文アップロードはチケット (.ticket.available) が必要です";
@@ -1629,8 +1921,8 @@ function applyEligibility({ upload = false, remove = false } = {}) {
   btnPaperDelete.title = remove
     ? "選択した論文を削除"
     : "論文削除はチケット (.ticket.remove) が必要です";
-  // Re-run the selection-aware enable/disable so dropdown state is
-  // respected after the eligibility flip.
+  // Re-run the selection-aware enable/disable so dropdown + lab-selection
+  // state is respected after the eligibility flip.
   if (typeof updatePaperButtons === "function") updatePaperButtons();
 }
 
@@ -1660,8 +1952,14 @@ fileInput.addEventListener("change", async () => {
     alert("PDF ファイルを選択してください");
     return;
   }
+  const targetLab = singleSelectedLab();
+  if (!targetLab) {
+    alert("アップロード先の Lab を 1 つだけ選択してください");
+    return;
+  }
 
   uploadState.filename = file.name;
+  uploadState.operatorId = targetLab;
   uploadState.logOffset = 0;
   setUploadStage("アップロード準備中…");
   uploadFilename.textContent = file.name;
@@ -1679,7 +1977,7 @@ fileInput.addEventListener("change", async () => {
   // because the server's "no ticket" message is the actionable bit and
   // the modal alone is easy to miss when it's still loading.
   try {
-    const presignRes = await fetch("/api/upload/presign", {
+    const presignRes = await fetch(withLab("/api/upload/presign", targetLab), {
       method: "POST",
       headers: getAuthHeaders(USER_ID),
       body: JSON.stringify({ filename: file.name }),
@@ -1706,7 +2004,7 @@ fileInput.addEventListener("change", async () => {
     }
     uploadLog.textContent += `[s3] uploaded ${file.size} bytes\n`;
 
-    const startRes = await fetch("/api/upload/start", {
+    const startRes = await fetch(withLab("/api/upload/start", targetLab), {
       method: "POST",
       headers: getAuthHeaders(USER_ID),
       body: JSON.stringify({ job_id: presign.job_id }),
@@ -1757,8 +2055,8 @@ uploadIndicator.addEventListener("click", () => {
 });
 
 uploadApply.addEventListener("click", () => {
-  if (!uploadState.jobId) return;
-  applyGeneratedSlides(uploadState.jobId);
+  if (!uploadState.jobId || !uploadState.operatorId) return;
+  applyGeneratedSlides(uploadState.operatorId, uploadState.jobId);
   hideUploadOverlay();
 });
 
@@ -1769,75 +2067,131 @@ uploadApply.addEventListener("click", () => {
 // artifact set (HTML + script.md). Selecting one reuses those artifacts —
 // no regeneration — and just refreshes current_meta server-side.
 
-async function refreshPaperLibrary(selectJobId) {
-  try {
-    const r = await fetch("/api/upload/papers", { headers: getAuthHeaders(USER_ID) });
-    if (!r.ok) throw new Error(`status ${r.status}`);
-    const data = await r.json();
-    const papers = data.papers || [];
-    // Rebuild options (keep the placeholder at the top).
+async function refreshPaperLibrary(selectKey) {
+  // Until the user explicitly toggles at least one Lab ON, the dropdown
+  // stays locked. We bail before touching the network so a stale list
+  // from previously-selected Labs can't briefly remain selectable.
+  const selectedIds = Array.from(labState.selectedLabIds);
+  if (!selectedIds.length) {
     paperLibrary.innerHTML = "";
-    const placeholder = document.createElement("option");
-    placeholder.value = "";
-    placeholder.textContent = papers.length
-      ? "アップロード済み論文…"
-      : "（アップロード済み論文なし）";
-    paperLibrary.appendChild(placeholder);
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = "Lab を選択してください";
+    paperLibrary.appendChild(ph);
+    paperLibrary.disabled = true;
+    updatePaperButtons();
+    return;
+  }
+
+  // Fan out to every selected Lab in parallel. A partial failure (one Lab
+  // offline / errored) doesn't block the rest from rendering — we just
+  // console.warn and skip that group.
+  const results = await Promise.all(selectedIds.map(async (opId) => {
+    try {
+      const r = await fetch(withLab("/api/upload/papers", opId),
+                            { headers: getAuthHeaders(USER_ID) });
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      const data = await r.json();
+      return { opId, papers: Array.isArray(data.papers) ? data.papers : [] };
+    } catch (e) {
+      console.warn(`[library] fetch failed for op=${opId}:`, e.message);
+      return { opId, papers: [], error: e.message };
+    }
+  }));
+
+  paperLibrary.innerHTML = "";
+  const totalCount = results.reduce((n, r) => n + r.papers.length, 0);
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = totalCount
+    ? "アップロード済み論文…"
+    : "（選択 Lab に論文なし）";
+  paperLibrary.appendChild(placeholder);
+
+  // One <optgroup> per Lab so the user can see which Lab a paper belongs to
+  // — that mapping is what option.value (encoded as "<op>|<job>") preserves
+  // for apply/delete handlers.
+  for (const { opId, papers, error } of results) {
+    if (!papers.length && !error) continue;
+    const grp = document.createElement("optgroup");
+    const labelBase = labState.labels[opId] || opId.slice(0, 6);
+    grp.label = error ? `${labelBase} (取得失敗)` : labelBase;
     for (const p of papers) {
       const opt = document.createElement("option");
-      opt.value = p.job_id;
+      opt.value = paperKey(opId, p.job_id);
       const label = p.theme || p.filename || p.job_id;
       opt.textContent = `${label} (${p.slides}枚)`;
-      paperLibrary.appendChild(opt);
+      grp.appendChild(opt);
     }
-    if (selectJobId && papers.some((p) => p.job_id === selectJobId)) {
-      paperLibrary.value = selectJobId;
-    }
-    paperLibrary.disabled = papers.length === 0;
-    updatePaperButtons();
-  } catch (e) {
-    console.warn("[library] refresh failed:", e.message);
+    paperLibrary.appendChild(grp);
   }
+
+  if (selectKey) {
+    const opt = paperLibrary.querySelector(`option[value="${CSS.escape(selectKey)}"]`);
+    if (opt) paperLibrary.value = selectKey;
+  }
+  paperLibrary.disabled = totalCount === 0;
+  updatePaperButtons();
 }
 
 function updatePaperButtons() {
+  const labCount = labState.selectedLabIds.size;
   const has = !!paperLibrary.value;
-  btnPaperApply.disabled = !has;
-  // Delete is gated by BOTH a selection AND a remove-ticket. The
-  // ticket flag was stashed onto the dataset by applyEligibility().
-  // Empty dataset (= eligibility never resolved) treats as no ticket
-  // so we fail closed.
+  btnPaperApply.disabled = labCount === 0 || !has;
+  // Delete is gated by paper selection + remove-ticket. The owning Lab is
+  // baked into the option value so we don't need to enforce single-Lab.
   const ticketOk = btnPaperDelete.dataset.ticketOk === "1";
-  btnPaperDelete.disabled = !has || !ticketOk;
+  btnPaperDelete.disabled = labCount === 0 || !has || !ticketOk;
+  // Upload requires EXACTLY one selected Lab — uploading with 0 or >1 Labs
+  // selected has no unambiguous target. Tooltip explains the gate.
+  const uploadTicket = btnUpload?.dataset.ticketOk === "1";
+  if (btnUpload) {
+    btnUpload.disabled = labCount !== 1 || !uploadTicket;
+    if (!uploadTicket) {
+      btnUpload.title = "論文アップロードはチケット (.ticket.available) が必要です";
+    } else if (labCount === 0) {
+      btnUpload.title = "アップロードする Lab を 1 つ選択してください";
+    } else if (labCount > 1) {
+      btnUpload.title = "アップロード対象の Lab を 1 つに絞ってください";
+    } else {
+      btnUpload.title = "論文PDFをアップロードしてスライド生成";
+    }
+  }
 }
 
 paperLibrary.addEventListener("change", updatePaperButtons);
 
-async function applyPaperById(jobId) {
+async function applyPaperById(operatorId, jobId) {
+  if (!operatorId || !jobId) throw new Error("operator/job missing");
   cancelAuto();
   cancelResume();
   const r = await fetch(
-    `/api/upload/papers/${encodeURIComponent(jobId)}/select`,
+    withLab(`/api/upload/papers/${encodeURIComponent(jobId)}/select`, operatorId),
     { method: "POST", headers: getAuthHeaders(USER_ID) },
   );
   if (!r.ok) throw new Error(`select ${r.status}: ${await r.text()}`);
   const data = await r.json();
+  // Pin presenter narration / waiting / closing chat calls to this Lab so
+  // the LT persona stays consistent with the slides we just applied. Q&A
+  // still fans out to all selected Labs in parallel; that path bypasses
+  // currentLabId.
+  state.currentLabId = operatorId;
   applyTalkMeta({
     theme: data.theme || "",
     presenter: data.presenter || "",
     venue: data.venue || "",
   });
-  await applyGeneratedSlides(jobId);
+  await applyGeneratedSlides(operatorId, jobId);
   setStatus(`paper applied: ${data.filename || jobId}`);
   return data;
 }
 
 btnPaperApply.addEventListener("click", async () => {
-  const jobId = paperLibrary.value;
-  if (!jobId) return;
+  const parsed = parsePaperKey(paperLibrary.value);
+  if (!parsed) return;
   btnPaperApply.disabled = true;
   try {
-    await applyPaperById(jobId);
+    await applyPaperById(parsed.operator_id, parsed.job_id);
   } catch (e) {
     console.error("[library] apply failed:", e);
     alert(`論文の適用に失敗しました: ${e.message}`);
@@ -1847,16 +2201,17 @@ btnPaperApply.addEventListener("click", async () => {
 });
 
 btnPaperDelete.addEventListener("click", async () => {
-  const jobId = paperLibrary.value;
-  if (!jobId) return;
+  const parsed = parsePaperKey(paperLibrary.value);
+  if (!parsed) return;
   const opt = paperLibrary.options[paperLibrary.selectedIndex];
-  const label = opt ? opt.textContent : jobId;
+  const label = opt ? opt.textContent : parsed.job_id;
   if (!confirm(`「${label}」を削除します。よろしいですか?`)) return;
   btnPaperDelete.disabled = true;
   let lastStatus = 0;
   try {
     const r = await fetch(
-      `/api/upload/papers/${encodeURIComponent(jobId)}`,
+      withLab(`/api/upload/papers/${encodeURIComponent(parsed.job_id)}`,
+              parsed.operator_id),
       { method: "DELETE", headers: getAuthHeaders(USER_ID) },
     );
     if (!r.ok) {
@@ -1947,14 +2302,22 @@ btnPaperDelete.addEventListener("click", async () => {
     // Populate the "アップロード済み論文…" dropdown from disk-rehydrated
     // jobs so the user can pick a previously-processed paper.
     await refreshPaperLibrary();
-    // Deep-link: ?paper=<job_id> auto-selects + applies the named paper
-    // so a tab can boot directly into a specific talk.
-    const paperParam = new URLSearchParams(location.search).get("paper");
+    // Deep-link: ?lab=<operator_id>&paper=<job_id> auto-selects the named
+    // Lab + paper so a tab can boot directly into a specific talk. Both
+    // params are required now that papers live under a Lab — a bare
+    // ?paper= without ?lab= is logged and ignored.
+    const sp = new URLSearchParams(location.search);
+    const labParam = sp.get("lab");
+    const paperParam = sp.get("paper");
     if (paperParam) {
       try {
-        await applyPaperById(paperParam);
-        paperLibrary.value = paperParam;
-        updatePaperButtons();
+        if (!labParam) {
+          throw new Error("missing ?lab=<operator_id>");
+        }
+        labState.selectedLabIds.add(labParam);
+        await refreshLabs();
+        await applyPaperById(labParam, paperParam);
+        await refreshPaperLibrary(paperKey(labParam, paperParam));
       } catch (e) {
         console.warn("[boot] ?paper auto-apply failed:", e.message);
       }

@@ -143,15 +143,101 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
     border-bottom: 1px solid rgba(255,255,255,0.05);
-    display: flex; justify-content: space-between; align-items: baseline;
+    display: flex; align-items: center; gap: 8px;
   }
+  #side .panel h3 .title { flex: 1; }
   #side .panel h3 .count {
     color: #e94560; font-weight: 600; font-size: 1em;
   }
+  /* Hamburger toggle for collapsible panels (participants, labs).
+     Q&A panel has no [data-collapsible] so its h3 has no .ham. */
+  #side .panel h3 .ham {
+    background: none; border: none; padding: 0;
+    color: #98a0c0; font-size: 1.15em; line-height: 1;
+    cursor: pointer; flex-shrink: 0;
+  }
+  #side .panel h3 .ham:hover { color: #e94560; }
+  #side .panel.collapsed { flex: 0 0 auto; max-height: none; }
+  #side .panel.collapsed .body { display: none; }
+  #side .panel.collapsed h3 { border-bottom: none; }
   #side #participants { flex: 0 0 auto; max-height: 32%; }
   #side #participants .body {
     overflow-y: auto;
     padding: 8px 10px;
+  }
+  #side #labs { flex: 0 0 auto; max-height: 40%; }
+  #side #labs .body {
+    overflow-y: auto;
+    padding: 8px 10px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .lab-empty { color: #5a6280; font-size: 0.85em; padding: 8px 4px; text-align: center; }
+  .lab-row {
+    background: #11192e;
+    border: 1px solid #1a2245;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 0.86em;
+    line-height: 1.4;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .lab-row:hover { border-color: #3a4870; }
+  .lab-row:focus { outline: none; border-color: #3a4870; }
+  .lab-row.selected {
+    border-color: #e94560;
+    background: rgba(233, 69, 96, 0.08);
+    box-shadow: 0 0 0 1px #e94560 inset;
+  }
+  .lab-row.selected .lab-name { color: #f5f5fa; }
+  .lab-row .lab-head {
+    display: flex; align-items: baseline; gap: 6px;
+    margin-bottom: 4px;
+  }
+  /* Multi-select checkbox icon. ::before is the empty box; .selected swaps
+     it to a check via content swap so we don't ship a font/asset. */
+  .lab-row .lab-check {
+    width: 14px; height: 14px;
+    border: 1px solid #4a5878; border-radius: 3px;
+    display: inline-block; flex-shrink: 0;
+    position: relative;
+    align-self: center;
+  }
+  .lab-row.selected .lab-check {
+    background: #e94560; border-color: #e94560;
+  }
+  .lab-row.selected .lab-check::after {
+    content: "";
+    position: absolute;
+    left: 3px; top: 0px;
+    width: 5px; height: 9px;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
+  .lab-row .lab-name {
+    color: #cfd5e6; font-weight: 600; font-size: 1em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .lab-row .lab-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: #5ad08b; box-shadow: 0 0 6px #5ad08b;
+    flex-shrink: 0;
+  }
+  .lab-row .lab-stats {
+    margin-left: auto;
+    color: #8a93b0; font-size: 0.78em;
+    white-space: nowrap;
+  }
+  .lab-row .lab-summary {
+    color: #b8bed4;
+    font-size: 0.85em;
+    /* user-content-derived multi-line text */
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .lab-row .lab-meta {
+    color: #6a7392; font-size: 0.74em; margin-top: 4px;
   }
   .user-row {
     display: flex; align-items: flex-start; gap: 8px;
@@ -197,9 +283,35 @@
   .qa-item .meta {
     color: #8a93b0; font-size: 0.78em;
     margin-bottom: 4px;
-    display: flex; gap: 6px; align-items: baseline;
+    display: flex; gap: 6px; align-items: center;
+    flex-wrap: wrap;
   }
   .qa-item .meta .who { color: #cfd5e6; font-weight: 600; }
+  .qa-item .meta .lab-badge {
+    background: rgba(233, 69, 96, 0.15);
+    color: #f0a8b6;
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-size: 0.85em;
+    font-weight: 600;
+    border: 1px solid rgba(233, 69, 96, 0.4);
+  }
+  .qa-item .meta .acc-badge {
+    margin-left: auto;
+    color: #98a0c0; font-size: 0.85em;
+    background: #0b1124; border: 1px solid #1a2245;
+    padding: 1px 6px; border-radius: 10px;
+  }
+  .qa-item .meta .qa-speak {
+    background: none; border: 1px solid #2a3a5a; color: #cfd5e6;
+    border-radius: 50%;
+    width: 22px; height: 22px;
+    cursor: pointer; padding: 0;
+    font-size: 0.85em; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .qa-item .meta .qa-speak:hover { border-color: #e94560; color: #f0a8b6; }
+  .qa-item .meta .qa-speak:disabled { opacity: 0.4; cursor: not-allowed; }
   .qa-item .q { color: #f0a8b6; margin-bottom: 4px; }
   .qa-item .q:before { content: "Q "; color: #e94560; font-weight: 700; }
   .qa-item .a { color: #d5d8e8; }
@@ -236,6 +348,13 @@
   }
   footer select:focus { outline: none; border-color: #e94560; }
   footer select:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* paper-library is grouped by Lab when multiple are selected. The optgroup
+     label color makes the per-Lab divider easier to read in dark mode. */
+  footer select optgroup {
+    color: #98a0c0; background: #11192e;
+    font-style: normal; font-weight: 600;
+  }
+  footer select option { color: #e0e0e0; }
   footer .status {
     font-size: 0.82em; color: #98a0c0; margin-left: auto;
   }
@@ -433,12 +552,26 @@
   </section>
 
   <aside id="side">
-    <div class="panel" id="participants">
-      <h3>参加者 <span class="count" id="participants-count">0</span></h3>
+    <div class="panel collapsed" id="participants" data-collapsible>
+      <h3>
+        <button class="ham" type="button" aria-label="toggle" aria-expanded="false">☰</button>
+        <span class="title">参加者</span>
+        <span class="count" id="participants-count">0</span>
+      </h3>
       <div class="body" id="participants-list"></div>
     </div>
+    <div class="panel collapsed" id="labs" data-collapsible>
+      <h3>
+        <button class="ham" type="button" aria-label="toggle" aria-expanded="false">☰</button>
+        <span class="title">Lab一覧</span>
+        <span class="count" id="labs-count">0</span>
+      </h3>
+      <div class="body" id="labs-list">
+        <div class="lab-empty">接続中の Lab はありません。</div>
+      </div>
+    </div>
     <div class="panel" id="qa-list">
-      <h3>質疑応答 <span class="count" id="qa-count">0</span></h3>
+      <h3><span class="title">質疑応答</span> <span class="count" id="qa-count">0</span></h3>
       <div class="body" id="qa-body">
         <div class="qa-item empty">まだ質問はありません。</div>
       </div>

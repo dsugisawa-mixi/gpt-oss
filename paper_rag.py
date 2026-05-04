@@ -217,6 +217,14 @@ def reload_index() -> bool:
     return True
 
 
+def get_index_meta() -> Optional[dict]:
+    """Return a shallow copy of the current index meta, or None if unloaded.
+    Acquires the swap lock so a concurrent reload_index() can't tear state.
+    Caller-mutable copy."""
+    with _swap_lock:
+        return dict(_index_meta) if _index_meta else None
+
+
 def _filter_to_sql(filter: dict) -> str:
     """Convert a flat {key: value} dict into a LanceDB WHERE clause.
 

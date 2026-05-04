@@ -104,6 +104,14 @@ SLIDE_NODE = os.environ.get("SLIDE_NODE", "node")
 UPLOAD_LOG_TAIL = int(os.environ.get("UPLOAD_LOG_TAIL", "200"))
 UPLOAD_PDF_MAX_MB = int(os.environ.get("UPLOAD_PDF_MAX_MB", "30"))
 
+# Lab self-description (multi-lab fan-out): tunnel_client fetches
+# /api/lab/summary and forwards it to the proxy via update_operator. The
+# proxy's /api/tunnel/info exposes it to the GUI for trust-score ranking.
+LAB_ID = os.environ.get("LAB_ID", "")
+LAB_NAME = os.environ.get("LAB_NAME", "")
+LAB_SUMMARY_TEXT = os.environ.get("LAB_SUMMARY", "")
+LAB_SUMMARY_MAX_CHARS = int(os.environ.get("LAB_SUMMARY_MAX_CHARS", "200"))
+
 # Browser uploads bypass the WebSocket tunnel (which has a 1 MB frame
 # cap) by PUT-ing the PDF directly to S3 with a presigned URL. Only the
 # tiny presign/start control-plane requests travel through the tunnel.
@@ -329,6 +337,15 @@ class ChatResponse(BaseModel):
     stage: str
     slide_page: Optional[int] = None
     voice: str = "male"
+    # Lab self-id (LAB_ID env). The GUI fans out qa-stage chat to multiple
+    # Labs in parallel; this lets each response carry its origin without the
+    # client having to remember "which operator did I send this to".
+    lab_id: str = ""
+    # Per-response trust signal. mean/top scores come from the RAG hits
+    # used as grounding context; rag_hits is the count of hits that fit
+    # within top_k. Empty knowledge ⇒ all zeros (presenter narration with
+    # only slide context, or an empty RAG index).
+    accuracy: dict = {}
 
 
 class GoogleAuthRequest(BaseModel):
@@ -486,9 +503,13 @@ def _record_qa(
     question: str,
     answer: str,
     slide_page: Optional[int],
+    lab_id: str = "",
+    accuracy: Optional[dict] = None,
 ) -> dict:
     """Append one Q&A exchange under the asking user's record. The qa_id is
-    process-globally unique and monotonic so clients can paginate by it."""
+    process-globally unique within this Lab; it is NOT unique across Labs,
+    so multi-Lab clients merge timelines by `ts`. lab_id + accuracy are
+    persisted so the merged GUI can label items and rank parallel answers."""
     global _qa_id_counter
     _qa_id_counter += 1
     rec = _touch_presence(user_id) or participants.get(user_id)
@@ -501,6 +522,8 @@ def _record_qa(
         "answer": answer,
         "slide_page": slide_page,
         "ts": time.time(),
+        "lab_id": lab_id,
+        "accuracy": accuracy or {},
     }
     if rec is not None:
         rec.setdefault("qa", []).append(entry)
@@ -1159,6 +1182,19 @@ async def chat(req: ChatRequest):
             top_k = 2 if req.stage == "qa" else 5
             knowledge = retrieve_knowledge(query, top_k=top_k)
 
+    # Per-response accuracy from the RAG hits we just gathered. Computed
+    # here (before _record_qa) so both the persisted timeline entry and
+    # the ChatResponse carry the same numbers without a second search.
+    if knowledge:
+        scores = [float(k.get("score", 0.0)) for k in knowledge]
+        accuracy = {
+            "rag_hits": len(scores),
+            "top_score": max(scores) if scores else 0.0,
+            "mean_score": sum(scores) / len(scores) if scores else 0.0,
+        }
+    else:
+        accuracy = {"rag_hits": 0, "top_score": 0.0, "mean_score": 0.0}
+
     slide_dict = req.slide.model_dump() if req.slide else None
 
     prompt_messages = build_prompt_messages(
@@ -1208,6 +1244,8 @@ async def chat(req: ChatRequest):
             question=req.message.strip(),
             answer=storable_reply,
             slide_page=req.slide.page if req.slide else None,
+            lab_id=LAB_ID,
+            accuracy=accuracy,
         )
 
     # Touch presence on any chat call so an active speaker counts as online.
@@ -1219,6 +1257,8 @@ async def chat(req: ChatRequest):
         stage=req.stage,
         slide_page=req.slide.page if req.slide else None,
         voice=(req.voice or "male"),
+        lab_id=LAB_ID,
+        accuracy=accuracy,
     )
 
 
@@ -1227,6 +1267,61 @@ async def get_config():
     """Frontend bootstrap config. tts_url is a relative /api/ path so the
     browser stays on the proxy origin and CORS does not enter the picture."""
     return {"tts_url": TTS_PUBLIC_PATH}
+
+
+def _build_lab_summary_payload() -> dict:
+    """Compose the lab summary (RAG corpus stats + curator tagline + current LT meta).
+    Used by the multi-lab fan-out flow: tunnel_client fetches this and posts it
+    to the proxy via update_operator."""
+    meta = None
+    if _paper_rag is not None:
+        try:
+            meta = _paper_rag.get_index_meta()
+        except Exception:
+            logger.exception("paper_rag.get_index_meta failed")
+    by_type = (meta or {}).get("by_type", {}) or {}
+    papers_count = sum(by_type.get(k, 0) for k in ("paper", "preprint", "patent"))
+
+    tagline = LAB_SUMMARY_TEXT.strip()
+    if not tagline:
+        bits = []
+        theme = (current_meta.get("theme") or "").strip()
+        if theme:
+            bits.append(f"現在のテーマ「{theme}」")
+        if papers_count:
+            bits.append(f"論文 {papers_count} 本のRAG")
+        chunks = (meta or {}).get("chunks")
+        if chunks:
+            bits.append(f"chunks={chunks}")
+        tagline = "、".join(bits) if bits else "（summary 未設定）"
+    if len(tagline) > LAB_SUMMARY_MAX_CHARS:
+        tagline = tagline[: LAB_SUMMARY_MAX_CHARS - 1] + "…"
+
+    return {
+        "lab_id": LAB_ID,
+        "name": LAB_NAME,
+        "summary": tagline,
+        "trust": {
+            "corpus_chunks": (meta or {}).get("chunks", 0),
+            "files": (meta or {}).get("files", 0),
+            "papers": papers_count,
+            "by_type": by_type,
+            "last_updated": (meta or {}).get("built_at"),
+            "embed_model": (meta or {}).get("model"),
+            "embed_dim": (meta or {}).get("dim"),
+        },
+        "current_meta": dict(current_meta),
+    }
+
+
+@app.get("/api/lab/summary")
+async def get_lab_summary():
+    """Lab self-description for proxy fan-out / GUI trust-ranking.
+
+    Fetched by tunnel_client after register and forwarded to the proxy as
+    update_operator. No auth — this is public-ish lab metadata used by the
+    multi-lab registry, not user data."""
+    return _build_lab_summary_payload()
 
 
 @app.post("/api/tts/generate_stream")
