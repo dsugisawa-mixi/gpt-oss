@@ -83,6 +83,7 @@ ENV SLIDE_GEN_PYTHON=/opt/conda/envs/professor/bin/python \
     SLIDE_NODE=node \
     PAPER_RAG_DEVICE=cpu \
     PAPER_RAG_RERANKER_DEVICE=cpu \
+    PAPER_DIR=/app/paper \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # --port default in your_professor_server.py is 8081 — matches the tunnel side.

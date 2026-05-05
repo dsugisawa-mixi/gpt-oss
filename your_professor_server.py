@@ -45,7 +45,7 @@ from botocore.client import Config as BotoConfig
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -138,11 +138,17 @@ GOOGLE_CLIENT_ID = os.environ.get(
 )
 # Allow only mixi.co.jp and its subdomains. Set ALLOWED_EMAIL_DOMAIN to override.
 ALLOWED_EMAIL_DOMAIN = os.environ.get("ALLOWED_EMAIL_DOMAIN", "mixi.co.jp")
-# Optional dev allowlist file: one email per line, '#'-comments + blank lines ignored.
-# Loaded once at startup; emails listed here pass the auth domain check even
-# if their domain is not ALLOWED_EMAIL_DOMAIN.
+# Optional dev allowlist + role grants. Each non-comment, non-blank line:
+#     <email> [role1,role2,...]
+# - Email-only lines bypass the ALLOWED_EMAIL_DOMAIN check.
+# - The optional second token is a comma-separated list of roles
+#   (no spaces inside) granted to that email. Roles gate role-protected
+#   endpoints — currently "ticket-admin" for /api/ticket/.
+# - Domain-allowed users may also appear here purely to receive roles;
+#   their listing has no effect on the domain check for anyone else.
 CUSTOM_AUTH_FILE = Path(os.environ.get("CUSTOM_AUTH_FILE", ".custom-auth.txt"))
 custom_allowlist: set[str] = set()
+custom_roles: dict[str, set[str]] = {}
 
 SYSTEM_PROMPT_TEMPLATE = """\
 # 役割
@@ -458,21 +464,34 @@ def _save_users(users: dict) -> None:
         json.dump(users, f, ensure_ascii=False, indent=2)
 
 
-def _load_custom_allowlist() -> set[str]:
-    """Read CUSTOM_AUTH_FILE into a set of lowercase emails. Comments + blank
-    lines ignored. Missing file is fine — returns empty set."""
-    out: set[str] = set()
+def _load_custom_auth() -> tuple[set[str], dict[str, set[str]]]:
+    """Read CUSTOM_AUTH_FILE → (allowlist, roles).
+
+    Each non-comment, non-blank line is `<email> [role1,role2,...]`. The
+    email goes into the allowlist (lowercased) regardless of whether
+    roles are present; the second token (if any) is split on ',' into a
+    set of role names mapped to that email. Missing file → ({}, {})."""
+    emails: set[str] = set()
+    roles: dict[str, set[str]] = {}
     if not CUSTOM_AUTH_FILE.exists():
-        return out
+        return emails, roles
     try:
         for line in CUSTOM_AUTH_FILE.read_text(encoding="utf-8").splitlines():
             s = line.strip()
             if not s or s.startswith("#"):
                 continue
-            out.add(s.lower())
+            parts = s.split(None, 1)
+            email = parts[0].lower()
+            emails.add(email)
+            if len(parts) == 2:
+                role_set = {
+                    r.strip() for r in parts[1].split(",") if r.strip()
+                }
+                if role_set:
+                    roles[email] = role_set
     except Exception:
         logger.exception("failed to read %s", CUSTOM_AUTH_FILE)
-    return out
+    return emails, roles
 
 
 def _is_allowed_email(email: str) -> bool:
@@ -581,6 +600,30 @@ def require_auth(request: Request) -> str:
     return uid
 
 
+def _user_roles(user_id: str) -> set[str]:
+    """Roles granted to a registered user via CUSTOM_AUTH_FILE. Looked up
+    by email (case-insensitive). Empty set if the user has no entry or
+    no roles."""
+    email = _user_email(user_id)
+    if not email:
+        return set()
+    return set(custom_roles.get(email, set()))
+
+
+def require_role(role: str):
+    """Build a FastAPI dependency that requires the caller to be
+    authenticated AND to have the given role assigned in
+    CUSTOM_AUTH_FILE. Returns the user_id on success."""
+    def dep(uid: str = Depends(require_auth)) -> str:
+        if role not in _user_roles(uid):
+            raise HTTPException(
+                status_code=403,
+                detail=f"role required: {role}",
+            )
+        return uid
+    return dep
+
+
 # =====================================================================
 # Tickets  (paid feature gate, single-use, per-action)
 # =====================================================================
@@ -686,6 +729,69 @@ def _user_email(user_id: str) -> str:
     return ((users.get(user_id) or {}).get("email") or "").strip().lower()
 
 
+# ---- Ticket admin CRUD helpers ----
+
+def _action_for_suffix(suffix: str) -> Optional[str]:
+    """Reverse-map a filename suffix (e.g. '.ticket.available') to its
+    action name. Returns None for '.ticket.consumed' — consumed tickets
+    keep the action only inside the JSON body."""
+    for action, sfx in TICKET_ACTION_SUFFIX.items():
+        if sfx == suffix:
+            return action
+    return None
+
+
+def _ticket_path_for(ticket_id: str) -> Optional[Path]:
+    """Locate the on-disk ticket file by its uuid, regardless of status.
+    Returns the first match (uuids are globally unique). None if no
+    match or TICKETS_DIR is missing. Rejects ids containing path
+    separators so callers can pass user input directly."""
+    if not TICKETS_DIR.exists() or "/" in ticket_id or ".." in ticket_id:
+        return None
+    matches = list(TICKETS_DIR.glob(f"{ticket_id}.ticket.*"))
+    return matches[0] if matches else None
+
+
+def _ticket_view(path: Path) -> dict:
+    """Render one ticket file as the /api/ticket/ API view. The action
+    is derived from the filename suffix when available (most accurate
+    for non-consumed tickets) and falls back to the JSON body for
+    consumed tickets where the suffix is just '.ticket.consumed'."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    name = path.name
+    if ".ticket." in name:
+        ticket_id, tail = name.split(".ticket.", 1)
+        suffix = ".ticket." + tail
+    else:
+        ticket_id, suffix = name, ""
+    if suffix == TICKET_CONSUMED_SUFFIX:
+        status = "consumed"
+        action = data.get("action") or ""
+    else:
+        status = "available"
+        action = _action_for_suffix(suffix) or data.get("action") or ""
+    return {
+        "ticket_id": ticket_id,
+        "action": action,
+        "status": status,
+        "email": (data.get("email") or data.get("google_account") or "").strip().lower(),
+        "note": data.get("note") or "",
+        "purchased_at": data.get("purchased_at") or "",
+        "transaction_id": data.get("transaction_id") or "",
+        "created_at": data.get("created_at") or 0,
+    }
+
+
+def _list_all_ticket_paths() -> list[Path]:
+    """Every ticket file in TICKETS_DIR — available + consumed."""
+    if not TICKETS_DIR.exists():
+        return []
+    return list(TICKETS_DIR.glob("*.ticket.*"))
+
+
 def _user_has_ticket(user_id: str, action: str) -> bool:
     """True iff the user is signed in AND has at least one ticket of
     the given action. Empty email or missing ticket -> False."""
@@ -771,12 +877,27 @@ _rag_ready: bool = False
 
 @app.on_event("startup")
 async def _preload_rag():
-    """Warm the embedder + index so the first /chat doesn't stall ~9s."""
+    """Warm the embedder + index so the first /chat doesn't stall ~9s.
+
+    If preload finds a usable on-disk index, flip _rag_ready immediately
+    so /api/* unblocks without waiting for the startup rebuild — that
+    rebuild can take minutes on CPU and there's no point gating
+    availability behind it when we already have a functional index.
+    The startup rebuild still runs in the background to pick up any
+    new uploads since the last build, and reload_index() atomically
+    swaps the result in when it finishes."""
+    global _rag_ready
     if _paper_rag is None:
         return
     try:
         ok = _paper_rag.preload()
         logger.info("paper_rag preload: %s", "ready" if ok else "unavailable")
+        if ok and not _rag_ready:
+            _rag_ready = True
+            logger.info(
+                "preload ready → /api/* unblocked (startup rebuild "
+                "continues in background)",
+            )
     except Exception:
         logger.exception("paper_rag preload failed")
 
@@ -811,11 +932,20 @@ async def _do_rag_rebuild_once(trigger: str) -> bool:
     Caller must hold _rag_rebuild_lock."""
     if _paper_rag is None:
         return False
-    logger.info("rag rebuild (%s): starting build_paper_index.py ...", trigger)
+    # build_paper_index.py defaults to ~/git/paper, which is the host
+    # layout. In container the paper tree is bind-mounted elsewhere
+    # (default /app/paper, overridable via PAPER_DIR env). Pass it
+    # explicitly so the rebuild works in both setups.
+    paper_dir = os.environ.get("PAPER_DIR", "/app/paper")
+    cmd = [sys.executable, "build_paper_index.py", "--paper-dir", paper_dir]
+    logger.info(
+        "rag rebuild (%s): starting build_paper_index.py --paper-dir %s ...",
+        trigger, paper_dir,
+    )
     t0 = time.time()
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable, "build_paper_index.py",
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -894,16 +1024,16 @@ async def _rag_rebuild_worker() -> None:
 
 @app.on_event("startup")
 async def _load_auth_allowlist():
-    """Load the dev email allowlist (CUSTOM_AUTH_FILE) into memory."""
-    global custom_allowlist
-    custom_allowlist = _load_custom_allowlist()
+    """Load the dev email allowlist + role grants (CUSTOM_AUTH_FILE)."""
+    global custom_allowlist, custom_roles
+    custom_allowlist, custom_roles = _load_custom_auth()
     if custom_allowlist:
         logger.info(
-            "custom auth allowlist: %d email(s) from %s",
-            len(custom_allowlist), CUSTOM_AUTH_FILE,
+            "custom auth: %d email(s), %d with roles, from %s",
+            len(custom_allowlist), len(custom_roles), CUSTOM_AUTH_FILE,
         )
     else:
-        logger.info("custom auth allowlist: none (%s missing or empty)", CUSTOM_AUTH_FILE)
+        logger.info("custom auth: none (%s missing or empty)", CUSTOM_AUTH_FILE)
 
 
 @app.on_event("startup")
@@ -2755,6 +2885,161 @@ async def select_uploaded_paper(job_id: str, _uid: str = Depends(require_auth)):
 @app.get("/api/meta")
 async def get_meta(_uid: str = Depends(require_auth)):
     return dict(current_meta)
+
+
+# =====================================================================
+# Ticket CRUD  (paper upload / paper delete tickets, ticket-admin only)
+# =====================================================================
+# Tickets are single-use credit files placed under TICKETS_DIR; they
+# gate /api/upload/start (action="upload") and DELETE /api/upload/papers
+# (action="remove"). This CRUD lets a ticket-admin mint, list, edit,
+# and revoke them without shelling into the host. All five endpoints
+# require the "ticket-admin" role granted via CUSTOM_AUTH_FILE.
+
+class TicketCreateRequest(BaseModel):
+    email: str
+    action: str  # "upload" | "remove"
+    note: Optional[str] = ""
+    purchased_at: Optional[str] = ""
+    transaction_id: Optional[str] = ""
+
+
+class TicketUpdateRequest(BaseModel):
+    email: Optional[str] = None
+    note: Optional[str] = None
+    purchased_at: Optional[str] = None
+    transaction_id: Optional[str] = None
+
+
+require_ticket_admin = require_role("ticket-admin")
+
+
+@app.get("/api/ticket/")
+async def list_tickets(
+    action: Optional[str] = None,
+    status: Optional[str] = None,
+    _uid: str = Depends(require_ticket_admin),
+):
+    """List every ticket file. Optional ?action=upload|remove and
+    ?status=available|consumed filters narrow the view. Sorted with
+    available tickets first (oldest → newest), consumed last."""
+    items = [_ticket_view(p) for p in _list_all_ticket_paths()]
+    if action:
+        items = [t for t in items if t["action"] == action]
+    if status:
+        items = [t for t in items if t["status"] == status]
+    items.sort(key=lambda t: (t["status"] != "available", t["created_at"]))
+    return {"tickets": items}
+
+
+@app.post("/api/ticket/", status_code=201)
+async def create_ticket(
+    req: TicketCreateRequest,
+    uid: str = Depends(require_ticket_admin),
+):
+    """Mint a new available ticket. Writes
+    TICKETS_DIR/<uuid>.ticket.<suffix> with action+email+metadata in
+    the JSON so consumed tickets remain identifiable post-rename."""
+    if req.action not in TICKET_ACTION_SUFFIX:
+        raise HTTPException(
+            400, f"invalid action: {req.action!r} (expected one of {list(TICKET_ACTION_SUFFIX)})",
+        )
+    email = req.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(400, "invalid email")
+    TICKETS_DIR.mkdir(parents=True, exist_ok=True)
+    ticket_id = str(uuid.uuid4())
+    suffix = TICKET_ACTION_SUFFIX[req.action]
+    path = TICKETS_DIR / f"{ticket_id}{suffix}"
+    payload = {
+        "ticket_id": ticket_id,
+        "email": email,
+        "action": req.action,
+        "note": req.note or "",
+        "purchased_at": req.purchased_at or "",
+        "transaction_id": req.transaction_id or "",
+        "created_at": int(time.time()),
+        "created_by": _user_email(uid) or uid,
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    logger.info(
+        "ticket: created %s for %s by %s", path.name, email, payload["created_by"],
+    )
+    return _ticket_view(path)
+
+
+@app.get("/api/ticket/{ticket_id}")
+async def get_ticket(
+    ticket_id: str,
+    _uid: str = Depends(require_ticket_admin),
+):
+    p = _ticket_path_for(ticket_id)
+    if p is None:
+        raise HTTPException(404, "ticket not found")
+    return _ticket_view(p)
+
+
+@app.put("/api/ticket/{ticket_id}")
+async def update_ticket(
+    ticket_id: str,
+    req: TicketUpdateRequest,
+    uid: str = Depends(require_ticket_admin),
+):
+    """Edit an existing ticket's email / note / receipt metadata.
+    Action and status are immutable here — to change them, delete and
+    re-create."""
+    p = _ticket_path_for(ticket_id)
+    if p is None:
+        raise HTTPException(404, "ticket not found")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if req.email is not None:
+        e = req.email.strip().lower()
+        if not e or "@" not in e:
+            raise HTTPException(400, "invalid email")
+        data["email"] = e
+        # If the ticket was authored under the legacy `google_account`
+        # field, drop it so future reads don't see two sources of truth.
+        data.pop("google_account", None)
+    if req.note is not None:
+        data["note"] = req.note
+    if req.purchased_at is not None:
+        data["purchased_at"] = req.purchased_at
+    if req.transaction_id is not None:
+        data["transaction_id"] = req.transaction_id
+    data["updated_at"] = int(time.time())
+    data["updated_by"] = _user_email(uid) or uid
+    p.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    logger.info("ticket: updated %s by %s", p.name, data["updated_by"])
+    return _ticket_view(p)
+
+
+@app.delete("/api/ticket/{ticket_id}", status_code=204)
+async def delete_ticket(
+    ticket_id: str,
+    uid: str = Depends(require_ticket_admin),
+):
+    """Hard-delete a ticket file (any status). Use with care: deleting
+    a consumed ticket erases its audit trail."""
+    p = _ticket_path_for(ticket_id)
+    if p is None:
+        raise HTTPException(404, "ticket not found")
+    try:
+        p.unlink()
+    except Exception as e:
+        logger.exception("ticket: delete failed for %s", p)
+        raise HTTPException(500, f"delete failed: {e}")
+    logger.info("ticket: deleted %s by %s", p.name, _user_email(uid) or uid)
+    # 204 must have an empty body — use Response (not JSONResponse, which
+    # would serialize None to "null" and trip uvicorn's Content-Length
+    # enforcement).
+    return Response(status_code=204)
 
 
 @app.get("/api/upload/jobs/{job_id}/slides", response_class=HTMLResponse)

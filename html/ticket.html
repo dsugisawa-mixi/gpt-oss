@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ticket Admin — Professor LT</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: 'Hiragino Sans', 'Yu Gothic', 'Segoe UI', sans-serif;
+    background: linear-gradient(135deg, #0d1226 0%, #16213e 50%, #0f3460 100%);
+    color: #e6e6f0;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    height: 100vh;
+    overflow: hidden;
+  }
+  header {
+    padding: 12px 18px;
+    background: rgba(0,0,0,0.35);
+    border-bottom: 1px solid rgba(233, 69, 96, 0.4);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  header h1 { font-size: 1.05em; color: #f5f5fa; }
+  header .meta { font-size: 0.78em; color: #98a0c0; }
+  header .spacer { flex: 1; }
+  header .me { font-size: 0.85em; color: #c0c8e0; }
+  header button {
+    background: transparent;
+    color: #c0c8e0;
+    border: 1px solid #3a4870;
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font: inherit;
+  }
+  header button:hover { border-color: #e94560; color: #fff; }
+
+  main {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 14px;
+    padding: 14px;
+    overflow: hidden;
+  }
+  aside, section {
+    background: rgba(15, 22, 46, 0.85);
+    border: 1px solid #2a3553;
+    border-radius: 10px;
+    padding: 12px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  h2 { font-size: 0.95em; color: #f5f5fa; margin-bottom: 10px; display: flex; gap: 8px; align-items: baseline; }
+  h2 .count { color: #98a0c0; font-weight: normal; font-size: 0.85em; }
+  h2 .target { color: #98a0c0; font-weight: normal; font-size: 0.85em; }
+
+  /* Lab list */
+  #labs-list { overflow-y: auto; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 4px; }
+  .lab {
+    display: block; width: 100%; text-align: left;
+    background: rgba(30, 42, 74, 0.7);
+    color: #d6dcef;
+    border: 1px solid #2a3553;
+    border-radius: 6px;
+    padding: 8px 10px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.9em;
+    line-height: 1.3;
+  }
+  .lab:hover { border-color: #4a5b8a; }
+  .lab.selected { background: #1a2447; border-color: #5d7ab6; color: #fff; }
+
+  /* Tickets */
+  #tickets-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  #tickets-head .filters { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+  select, input[type=text], input[type=email] {
+    background: #0e1530;
+    color: #e6e6f0;
+    border: 1px solid #3a4870;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font: inherit;
+    font-size: 0.88em;
+  }
+  button.primary, #btn-new {
+    background: #e94560;
+    border: 1px solid #e94560;
+    color: #fff;
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.88em;
+  }
+  button.primary:hover, #btn-new:hover { background: #d93553; }
+  button.primary:disabled, #btn-new:disabled { background: #3a4870; border-color: #3a4870; cursor: not-allowed; }
+  button.ghost {
+    background: transparent;
+    color: #c0c8e0;
+    border: 1px solid #3a4870;
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.88em;
+  }
+  button.ghost:hover { border-color: #e94560; color: #fff; }
+  button.ghost:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  #tickets-table-wrap { overflow: auto; flex: 1; min-height: 0; border: 1px solid #1f2a4a; border-radius: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+  thead th {
+    position: sticky; top: 0; z-index: 1;
+    background: #11182f;
+    color: #98a0c0;
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid #2a3553;
+    font-weight: 500;
+  }
+  tbody td {
+    padding: 8px 10px;
+    border-bottom: 1px solid #1f2a4a;
+    vertical-align: middle;
+  }
+  tbody tr:hover { background: rgba(30, 42, 74, 0.6); }
+  td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  td.muted, .muted { color: #98a0c0; }
+  td.error, .error { color: #ff6b80; }
+  .small { font-size: 0.92em; }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 0.78em;
+    border: 1px solid #3a4870;
+    background: #0e1530;
+  }
+  .badge.upload { background: #1c3a5c; border-color: #2f5680; color: #aac8e8; }
+  .badge.remove { background: #4a1c30; border-color: #6e2942; color: #f0a8b8; }
+  .badge.st-available { background: #1d3a2a; border-color: #2c5a3f; color: #8fdcb0; }
+  .badge.st-consumed { background: #2a2a2a; border-color: #444; color: #aaa; }
+
+  td.actions { white-space: nowrap; text-align: right; }
+  td.actions button {
+    background: transparent;
+    color: #c0c8e0;
+    border: 1px solid #3a4870;
+    border-radius: 5px;
+    padding: 3px 8px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.82em;
+    margin-left: 4px;
+  }
+  td.actions button:hover { border-color: #e94560; color: #fff; }
+  td.actions .btn-del:hover { background: #5a1622; border-color: #5a1622; color: #fff; }
+
+  /* Modal */
+  #modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 100;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #modal-bg[hidden] { display: none; }
+  #modal {
+    background: #161e3a;
+    border: 1px solid #3a4870;
+    border-radius: 10px;
+    padding: 20px;
+    width: min(440px, 92vw);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+  }
+  #modal h3 { margin-bottom: 14px; color: #f5f5fa; font-size: 1em; }
+  #modal label {
+    display: block;
+    margin-bottom: 12px;
+    font-size: 0.85em;
+    color: #c0c8e0;
+  }
+  #modal label > * { display: block; width: 100%; margin-top: 4px; }
+  #modal .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  #m-error { color: #ff6b80; font-size: 0.85em; margin-top: 8px; min-height: 1em; }
+
+  /* Toast */
+  #toast {
+    position: fixed;
+    bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #1d3a2a; color: #d8f0e0;
+    border: 1px solid #2c5a3f;
+    padding: 10px 18px; border-radius: 8px;
+    font-size: 0.9em;
+    z-index: 200;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+  #toast[hidden] { display: none; }
+  #toast.error { background: #4a1c30; border-color: #6e2942; color: #f0c8d0; }
+
+  /* Banner for role-required errors */
+  #banner {
+    background: #5a1622;
+    color: #fff;
+    padding: 10px 18px;
+    text-align: center;
+    font-size: 0.9em;
+    border-bottom: 1px solid rgba(255,255,255,0.2);
+  }
+  #banner[hidden] { display: none; }
+</style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+<div id="banner" hidden></div>
+<header>
+  <h1>Ticket Admin</h1>
+  <span class="meta">論文アップロード／削除チケットの発行・管理</span>
+  <span class="spacer"></span>
+  <span class="me" id="me-name">—</span>
+  <button id="btn-logout" type="button">ログアウト</button>
+</header>
+
+<main>
+  <aside>
+    <h2>Lab一覧 <span class="count" id="labs-count">0</span></h2>
+    <div id="labs-list"><div class="muted small">読み込み中…</div></div>
+  </aside>
+
+  <section>
+    <div id="tickets-head">
+      <h2>チケット <span class="target" id="tickets-target">— Lab未選択 —</span></h2>
+      <div class="filters">
+        <select id="filter-action">
+          <option value="">all actions</option>
+          <option value="upload">upload</option>
+          <option value="remove">remove</option>
+        </select>
+        <select id="filter-status">
+          <option value="">all status</option>
+          <option value="available">available</option>
+          <option value="consumed">consumed</option>
+        </select>
+        <button class="ghost" id="btn-refresh" type="button" disabled>↻ 更新</button>
+        <button id="btn-new" type="button" disabled>+ 新規発行</button>
+      </div>
+    </div>
+    <div id="tickets-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>action</th>
+            <th>status</th>
+            <th>email</th>
+            <th>note</th>
+            <th>created</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="tickets-body">
+          <tr><td colspan="7" class="muted">— 左の Lab を選んでください —</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="modal-bg" hidden>
+  <div id="modal">
+    <h3 id="modal-title">新規発行</h3>
+    <label>email
+      <input id="m-email" type="email" placeholder="user@example.com" autocomplete="off">
+    </label>
+    <label>action
+      <select id="m-action">
+        <option value="upload">upload (論文アップロード用)</option>
+        <option value="remove">remove (論文削除用)</option>
+      </select>
+    </label>
+    <label>note (任意)
+      <input id="m-note" type="text" autocomplete="off">
+    </label>
+    <label>purchased_at (任意)
+      <input id="m-purchased" type="text" placeholder="2026-05-01T18:25:00+09:00" autocomplete="off">
+    </label>
+    <label>transaction_id (任意)
+      <input id="m-tx" type="text" autocomplete="off">
+    </label>
+    <div id="m-error"></div>
+    <div class="row">
+      <button class="ghost" id="m-cancel" type="button">キャンセル</button>
+      <button class="primary" id="m-save" type="button">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" hidden></div>
+
+<script type="module">
+import { ensureUser, getAuthHeaders } from "/js/auth.js";
+
+// ---------- state ----------
+const state = {
+  userId: null,
+  displayName: null,
+  operatorId: null,
+  operatorName: null,
+  labels: {},      // operator.id -> human label
+  roleProbed: false,
+};
+
+// ---------- helpers ----------
+function $(id) { return document.getElementById(id); }
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[c]);
+}
+function formatTs(t) {
+  if (!t) return "—";
+  const d = new Date(Number(t) * 1000);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleString();
+}
+function withLab(path, opId) {
+  if (!opId) return path;
+  const sep = path.includes("?") ? "&" : "?";
+  return `${path}${sep}operator_id=${encodeURIComponent(opId)}`;
+}
+function showBanner(msg) {
+  const el = $("banner");
+  el.textContent = msg;
+  el.hidden = false;
+}
+function hideBanner() { $("banner").hidden = true; }
+let toastTimer;
+function showToast(msg, kind = "info") {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = kind === "error" ? "error" : "";
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 3500);
+}
+async function readDetail(r) {
+  try { return (await r.json()).detail || ""; } catch (_) { return ""; }
+}
+
+// ---------- labs ----------
+async function refreshLabs() {
+  let r;
+  try { r = await fetch("/api/tunnel/info"); } catch (_) { return; }
+  if (!r.ok) return;
+  const d = await r.json();
+  const ops = Array.isArray(d.operators) ? d.operators : [];
+  $("labs-count").textContent = ops.length;
+  const list = $("labs-list");
+  list.innerHTML = "";
+
+  // Refresh label cache and drop disappeared selection.
+  state.labels = {};
+  for (const op of ops) {
+    state.labels[op.id] = (op.lab && (op.lab.name || op.lab.lab_id))
+      || op.name || (op.id ? op.id.slice(0, 6) : "Lab");
+  }
+  if (state.operatorId && !state.labels[state.operatorId]) {
+    state.operatorId = null;
+    state.operatorName = null;
+    $("tickets-target").textContent = "— Lab未選択 —";
+    $("btn-new").disabled = true;
+    $("btn-refresh").disabled = true;
+    $("tickets-body").innerHTML = `<tr><td colspan="7" class="muted">— 左の Lab を選んでください —</td></tr>`;
+  }
+
+  if (!ops.length) {
+    list.innerHTML = `<div class="muted small">接続中の Lab はありません。</div>`;
+    return;
+  }
+  for (const op of ops) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "lab" + (state.operatorId === op.id ? " selected" : "");
+    btn.textContent = state.labels[op.id];
+    btn.onclick = () => selectLab(op.id);
+    list.appendChild(btn);
+  }
+
+  // Early role probe — confirm the signed-in user has ticket-admin
+  // before they click a Lab. We pick the first operator and do a
+  // cheap GET /api/ticket/. 401/403/4xx/5xx → banner with the
+  // server's detail. Run once per session unless it succeeds.
+  if (!state.roleProbed && ops.length > 0) {
+    state.roleProbed = true;
+    probeRole(ops[0].id);
+  }
+}
+
+async function probeRole(opId) {
+  let r;
+  try {
+    r = await fetch(withLab("/api/ticket/", opId), {
+      headers: getAuthHeaders(state.userId),
+    });
+  } catch (e) {
+    showBanner(`API へ接続できません: ${e.message}`);
+    return;
+  }
+  if (r.ok) { hideBanner(); return; }
+  const det = await readDetail(r);
+  if (r.status === 401) {
+    showBanner(`未認証: ${det || "サインインが必要です"} — ページを再読み込みしてください`);
+  } else if (r.status === 403) {
+    showBanner(
+      `権限が不足しています — このアカウント (${state.displayName || ""}) には ` +
+      `ticket-admin ロールが付与されていません。サーバの .custom-auth.txt に ` +
+      `「<email> ticket-admin」を追加してください。詳細: ${det || "role required: ticket-admin"}`
+    );
+  } else if (r.status === 503) {
+    showBanner(`Lab 起動中 (HTTP 503): RAG インデックスの再構築待ちです。少し待ってから再読み込みしてください。`);
+    state.roleProbed = false;  // re-probe next refresh
+  } else {
+    showBanner(`API エラー HTTP ${r.status}: ${det}`);
+  }
+}
+
+function selectLab(opId) {
+  state.operatorId = opId;
+  state.operatorName = state.labels[opId] || opId;
+  $("tickets-target").textContent = state.operatorName;
+  $("btn-new").disabled = false;
+  $("btn-refresh").disabled = false;
+  // Re-render lab list to update selection highlight.
+  document.querySelectorAll("#labs-list .lab").forEach(b => {
+    b.classList.toggle("selected", b.textContent === state.operatorName);
+  });
+  refreshTickets();
+}
+
+// ---------- tickets ----------
+async function refreshTickets() {
+  if (!state.operatorId) return;
+  const params = new URLSearchParams();
+  const fa = $("filter-action").value;
+  const fs = $("filter-status").value;
+  if (fa) params.set("action", fa);
+  if (fs) params.set("status", fs);
+  const qs = params.toString();
+  const path = "/api/ticket/" + (qs ? "?" + qs : "");
+  const url = withLab(path, state.operatorId);
+  const tbody = $("tickets-body");
+  tbody.innerHTML = `<tr><td colspan="7" class="muted">読み込み中…</td></tr>`;
+  let r;
+  try {
+    r = await fetch(url, { headers: getAuthHeaders(state.userId) });
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="error">接続エラー: ${escapeHtml(e.message)}</td></tr>`;
+    return;
+  }
+  if (!r.ok) {
+    const det = await readDetail(r);
+    if (r.status === 403) {
+      showBanner(`権限が不足しています — このアカウントには ticket-admin ロールが付与されていません (${det || "role required: ticket-admin"})`);
+    }
+    tbody.innerHTML = `<tr><td colspan="7" class="error">HTTP ${r.status}: ${escapeHtml(det)}</td></tr>`;
+    return;
+  }
+  hideBanner();
+  const d = await r.json();
+  const tickets = Array.isArray(d.tickets) ? d.tickets : [];
+  if (!tickets.length) {
+    tbody.innerHTML = `<tr><td colspan="7" class="muted">— チケット 0 件 —</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = "";
+  for (const t of tickets) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="mono small" title="${escapeHtml(t.ticket_id)}">${escapeHtml((t.ticket_id || "").slice(0, 8))}…</td>
+      <td><span class="badge ${escapeHtml(t.action)}">${escapeHtml(t.action)}</span></td>
+      <td><span class="badge st-${escapeHtml(t.status)}">${escapeHtml(t.status)}</span></td>
+      <td>${escapeHtml(t.email)}</td>
+      <td class="small">${escapeHtml(t.note || "")}</td>
+      <td class="small">${escapeHtml(formatTs(t.created_at))}</td>
+      <td class="actions">
+        <button class="btn-edit" data-id="${escapeHtml(t.ticket_id)}">編集</button>
+        <button class="btn-del" data-id="${escapeHtml(t.ticket_id)}">削除</button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+  tbody.querySelectorAll(".btn-edit").forEach(b =>
+    b.onclick = () => openEditModal(b.dataset.id));
+  tbody.querySelectorAll(".btn-del").forEach(b =>
+    b.onclick = () => deleteTicket(b.dataset.id));
+}
+
+// ---------- modal ----------
+let modalMode = "create";
+let modalTicketId = null;
+
+function openCreateModal() {
+  modalMode = "create";
+  modalTicketId = null;
+  $("modal-title").textContent = `新規発行 — ${state.operatorName}`;
+  $("m-email").value = "";
+  $("m-action").value = "upload";
+  $("m-action").disabled = false;
+  $("m-note").value = "";
+  $("m-purchased").value = "";
+  $("m-tx").value = "";
+  $("m-error").textContent = "";
+  $("modal-bg").hidden = false;
+  setTimeout(() => $("m-email").focus(), 50);
+}
+
+async function openEditModal(ticketId) {
+  modalMode = "edit";
+  modalTicketId = ticketId;
+  const url = withLab(`/api/ticket/${encodeURIComponent(ticketId)}`, state.operatorId);
+  let r;
+  try { r = await fetch(url, { headers: getAuthHeaders(state.userId) }); }
+  catch (e) { showToast("読み込み失敗: " + e.message, "error"); return; }
+  if (!r.ok) { showToast(`HTTP ${r.status}: ${await readDetail(r)}`, "error"); return; }
+  const t = await r.json();
+  $("modal-title").textContent = `編集 (${t.action} / ${t.status})`;
+  $("m-email").value = t.email || "";
+  $("m-action").value = t.action || "upload";
+  $("m-action").disabled = true;  // immutable on edit
+  $("m-note").value = t.note || "";
+  $("m-purchased").value = t.purchased_at || "";
+  $("m-tx").value = t.transaction_id || "";
+  $("m-error").textContent = "";
+  $("modal-bg").hidden = false;
+  setTimeout(() => $("m-email").focus(), 50);
+}
+
+function closeModal() { $("modal-bg").hidden = true; }
+
+async function saveModal() {
+  const email = $("m-email").value.trim();
+  const note = $("m-note").value;
+  const purchased = $("m-purchased").value.trim();
+  const tx = $("m-tx").value.trim();
+  const action = $("m-action").value;
+  if (!email || !email.includes("@")) {
+    $("m-error").textContent = "email を入力してください";
+    return;
+  }
+  let url, method, body;
+  if (modalMode === "create") {
+    url = withLab("/api/ticket/", state.operatorId);
+    method = "POST";
+    body = { email, action, note, purchased_at: purchased, transaction_id: tx };
+  } else {
+    url = withLab(`/api/ticket/${encodeURIComponent(modalTicketId)}`, state.operatorId);
+    method = "PUT";
+    body = { email, note, purchased_at: purchased, transaction_id: tx };
+  }
+  let r;
+  try {
+    r = await fetch(url, {
+      method,
+      headers: getAuthHeaders(state.userId),
+      body: JSON.stringify(body),
+    });
+  } catch (e) { $("m-error").textContent = "通信エラー: " + e.message; return; }
+  if (!r.ok) {
+    $("m-error").textContent = `HTTP ${r.status}: ${await readDetail(r)}`;
+    return;
+  }
+  closeModal();
+  showToast(modalMode === "create" ? "発行しました" : "更新しました");
+  refreshTickets();
+}
+
+async function deleteTicket(ticketId) {
+  if (!confirm(`チケット ${ticketId.slice(0, 8)}… を削除しますか？`)) return;
+  const url = withLab(`/api/ticket/${encodeURIComponent(ticketId)}`, state.operatorId);
+  let r;
+  try {
+    r = await fetch(url, { method: "DELETE", headers: getAuthHeaders(state.userId) });
+  } catch (e) { showToast("削除失敗: " + e.message, "error"); return; }
+  if (!r.ok && r.status !== 204) {
+    showToast(`削除失敗 HTTP ${r.status}: ${await readDetail(r)}`, "error");
+    return;
+  }
+  showToast("削除しました");
+  refreshTickets();
+}
+
+// ---------- logout ----------
+async function logout() {
+  try {
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      headers: getAuthHeaders(state.userId),
+    });
+  } catch (_) { /* best-effort */ }
+  localStorage.removeItem("professor_user_id");
+  localStorage.removeItem("professor_display_name");
+  location.reload();
+}
+
+// ---------- init ----------
+async function init() {
+  const me = await ensureUser({
+    userId: localStorage.getItem("professor_user_id"),
+    displayName: localStorage.getItem("professor_display_name"),
+  });
+  if (!me) return;  // ensureUser shows its own error overlay.
+  state.userId = me.userId;
+  state.displayName = me.displayName;
+  $("me-name").textContent = me.displayName || "(authenticated)";
+  $("btn-logout").onclick = logout;
+  $("btn-new").onclick = openCreateModal;
+  $("btn-refresh").onclick = refreshTickets;
+  $("filter-action").onchange = refreshTickets;
+  $("filter-status").onchange = refreshTickets;
+  $("m-cancel").onclick = closeModal;
+  $("m-save").onclick = saveModal;
+  $("modal-bg").onclick = (e) => { if (e.target.id === "modal-bg") closeModal(); };
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("modal-bg").hidden) closeModal();
+  });
+
+  await refreshLabs();
+  setInterval(refreshLabs, 5000);
+}
+
+init();
+</script>
+</body>
+</html>
