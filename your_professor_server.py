@@ -289,6 +289,7 @@ async def gate_until_rag_ready(request: Request, call_next):
         not _rag_ready
         and request.method != "OPTIONS"
         and request.url.path.startswith("/api/")
+        and not request.url.path.startswith("/api/internal/")
     ):
         logger.info("gate: 503 (rag not ready) %s %s",
                     request.method, request.url.path)
@@ -1802,16 +1803,38 @@ async def get_history(user_id: str, _uid: str = Depends(require_auth)):
 #      GET /api/upload/jobs/{job_id}/slides  (the generated single-page HTML).
 
 _s3_client_cached = None
+# AWS creds arrive over the WS tunnel from the ECS proxy (see
+# /api/internal/aws-credentials). Until they land, S3 ops 503 out.
+_aws_creds: dict | None = None
+INTERNAL_TOKEN = os.environ.get("INTERNAL_TOKEN", "")
+
+
+def set_aws_credentials(access_key_id: str, secret_access_key: str,
+                        session_token: str | None,
+                        expiration: str | None) -> None:
+    global _aws_creds, _s3_client_cached
+    _aws_creds = {
+        "access_key_id": access_key_id,
+        "secret_access_key": secret_access_key,
+        "session_token": session_token,
+        "expiration": expiration,
+    }
+    _s3_client_cached = None  # rebuild on next _s3_client() call
 
 
 def _s3_client():
     global _s3_client_cached
     if _s3_client_cached is None:
+        if not _aws_creds:
+            raise RuntimeError("AWS credentials not yet received from proxy")
         # SigV4 + virtual-host addressing keeps the presigned URL clean
         # and forward-compatible with private-bucket policies.
         _s3_client_cached = boto3.client(
             "s3",
             region_name=S3_UPLOAD_REGION,
+            aws_access_key_id=_aws_creds["access_key_id"],
+            aws_secret_access_key=_aws_creds["secret_access_key"],
+            aws_session_token=_aws_creds.get("session_token"),
             config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "virtual"}),
         )
     return _s3_client_cached
@@ -2551,6 +2574,30 @@ async def _run_slide_generation(job_id: str):
                 proc.kill()
             except Exception:
                 pass
+
+
+@app.post("/api/internal/aws-credentials")
+async def internal_set_aws_credentials(request: Request):
+    """Receive STS creds relayed from the ECS proxy via tunnel_client.
+    Guarded by a shared INTERNAL_TOKEN — the endpoint never traverses
+    the public tunnel/proxy path (only callable on the compose-internal
+    network from proxy-tunnel)."""
+    if not INTERNAL_TOKEN or request.headers.get("x-internal-token") != INTERNAL_TOKEN:
+        raise HTTPException(403, "forbidden")
+    body = await request.json()
+    akid = body.get("access_key_id")
+    secret = body.get("secret_access_key")
+    if not akid or not secret:
+        raise HTTPException(400, "access_key_id / secret_access_key required")
+    set_aws_credentials(
+        access_key_id=akid,
+        secret_access_key=secret,
+        session_token=body.get("session_token"),
+        expiration=body.get("expiration"),
+    )
+    logger.info("aws creds installed (akid=%s..., exp=%s)",
+                akid[:6], body.get("expiration"))
+    return {"ok": True, "expiration": body.get("expiration")}
 
 
 @app.post("/api/upload/presign")

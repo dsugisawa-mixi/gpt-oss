@@ -302,6 +302,14 @@
     background: #0b1124; border: 1px solid #1a2245;
     padding: 1px 6px; border-radius: 10px;
   }
+  /* multi-Lab fan-out で top_score×const + reasoning length が最も高かった
+     回答を可視化する。同じ質問の競合 Lab のうち選ばれた一件のみに付く。 */
+  .qa-item .meta .best-badge {
+    color: #ffd266; font-size: 0.85em; font-weight: 700;
+    background: #2a1f08; border: 1px solid #5a4520;
+    padding: 1px 6px; border-radius: 10px;
+  }
+  .qa-item.is-best { border-color: #5a4520; box-shadow: 0 0 0 1px rgba(255, 210, 102, 0.3); }
   .qa-item .meta .qa-speak {
     background: none; border: 1px solid #2a3a5a; color: #cfd5e6;
     border-radius: 50%;

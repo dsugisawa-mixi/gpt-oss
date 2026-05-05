@@ -22,6 +22,23 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Google Chrome (stable) for puppeteer in html2pdf.mjs. The host's
+# ~/.cache/puppeteer (where `npm install puppeteer` drops the bundled
+# Chromium) is NOT visible inside this container, so puppeteer.launch()
+# would otherwise fail with "Could not find Chrome". We install Chrome
+# via Google's apt repo and point puppeteer at it via
+# PUPPETEER_EXECUTABLE_PATH (set further down).
+RUN install -d -m 0755 /usr/share/keyrings \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+        | gpg --dearmor -o /usr/share/keyrings/google-linux-signing-key.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-key.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+        > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        google-chrome-stable \
+        fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 # Use bash for all subsequent RUN steps so `source` and `conda activate` work
 SHELL ["/bin/bash", "-c"]
 
@@ -84,6 +101,7 @@ ENV SLIDE_GEN_PYTHON=/opt/conda/envs/professor/bin/python \
     PAPER_RAG_DEVICE=cpu \
     PAPER_RAG_RERANKER_DEVICE=cpu \
     PAPER_DIR=/app/paper \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # --port default in your_professor_server.py is 8081 — matches the tunnel side.

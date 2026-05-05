@@ -165,8 +165,10 @@ function updateNav() {
       btnSpeak.disabled = state.pageIndex < 1 || state.pageIndex > pages.length;
     }
   }
-  btnAsk.disabled = false;
-  inputQA.disabled = false;
+  // Ask は Lab 選択 (≥1) を要件にする。論文未適用でも質問可。
+  const hasLab = labState.selectedLabIds.size > 0;
+  btnAsk.disabled = !hasLab;
+  inputQA.disabled = !hasLab;
   btnEnd.disabled = false;
 }
 
@@ -1150,6 +1152,7 @@ async function refreshLabs() {
       elLabsList.appendChild(row);
     }
     if (dropped) refreshPaperLibrary();
+    updateAskAvailability();
   } catch (e) {
     console.warn("[labs] tunnel info fetch failed:", e.message);
   }
@@ -1178,6 +1181,17 @@ function toggleLab(id) {
   elQaCount.textContent = "0";
   refreshPaperLibrary();
   refreshQaTimeline();
+  updateAskAvailability();
+}
+
+// Ask は論文未適用でも、Lab が 1 つ以上選択されていれば許可する。
+// 論文を適用すると updateNav() が走って同じ enable をするが、それより
+// 前段（Lab 選択直後）でも質問できるようにこちらでもゲートを開ける。
+// 0 Lab に戻ったら逆に Ask を閉じる（fan-out 先がないため）。
+function updateAskAvailability() {
+  const hasLab = labState.selectedLabIds.size > 0;
+  btnAsk.disabled = !hasLab;
+  inputQA.disabled = !hasLab;
 }
 
 async function pollOnce() {
@@ -1367,9 +1381,45 @@ async function fanOutQa(question, labs) {
   setStatus(failed
     ? `asked ${ok}/${labs.length} labs (${failed} failed)`
     : `asked ${ok}/${labs.length} labs ✓`);
+
+  // 各 Lab の応答を採点。primary は RAG の retrieval top-1 score
+  // (Lab の知識ベースと質問のマッチ度)。tiebreaker に reasoning 長
+  // (= 回答にどれだけ肉付けしたか) を弱い重みで足す。
+  let bestOpId = null;
+  let bestScore = -Infinity;
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.status !== "fulfilled") continue;
+    const data = r.value || {};
+    const acc = data.accuracy || {};
+    const top = Number(acc.top_score) || 0;
+    const len = (data.reply || "").length;
+    const score = top * 1.0 + (len / 1000) * 0.1;
+    if (score > bestScore) {
+      bestScore = score;
+      bestOpId = labs[i];
+    }
+  }
+
   // Pull the just-recorded items into the merged timeline immediately so
   // the user doesn't wait the full 10s poll tick to see answers.
   await refreshQaTimeline();
+
+  // refreshQaTimeline() 後、lastQaIdByLab[opId] は今送った応答の qa_id を
+  // 指す (Lab ごとに新着 1 件のみ)。その composite key の DOM に ★ を付与。
+  if (bestOpId && lastQaIdByLab[bestOpId]) {
+    const key = `${bestOpId}:${lastQaIdByLab[bestOpId]}`;
+    const el = elQaBody.querySelector(
+      `.qa-item[data-qa-id="${CSS.escape(key)}"]`);
+    if (el && !el.querySelector(".best-badge")) {
+      el.classList.add("is-best");
+      const badge = document.createElement("span");
+      badge.className = "best-badge";
+      badge.textContent = "★ best";
+      badge.title = `score=${bestScore.toFixed(3)}`;
+      el.querySelector(".meta")?.appendChild(badge);
+    }
+  }
 }
 
 btnAsk.addEventListener("click", async () => {
