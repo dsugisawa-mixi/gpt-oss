@@ -272,6 +272,28 @@ async def log_response_time(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def gate_until_rag_ready(request: Request, call_next):
+    """Block every /api/* request with 503 until the startup RAG rebuild
+    has finished. Lets non-/api paths and CORS preflight through so the
+    static UI can still load and browsers can negotiate CORS while we
+    warm up. The proxy registry treats /api/lab/summary 503 as
+    'unavailable' and omits this lab from the LAB list."""
+    if (
+        not _rag_ready
+        and request.method != "OPTIONS"
+        and request.url.path.startswith("/api/")
+    ):
+        logger.info("gate: 503 (rag not ready) %s %s",
+                    request.method, request.url.path)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "lab warming up: rag index rebuild in progress"},
+            headers={"Retry-After": "10"},
+        )
+    return await call_next(request)
+
+
 # Global state
 generator = None   # vLLM TokenGenerator
 encoding = None    # Harmony encoding
@@ -736,6 +758,16 @@ except Exception:
 # observes a torn state and no upload's rebuild gets dropped.
 _rag_rebuild_queue: "asyncio.Queue[str]" = None  # initialized at startup
 
+# Service-readiness gate. False until the worker has drained the
+# "startup" trigger enqueued by _enqueue_startup_rebuild — i.e. until
+# build_paper_index.py has finished and the in-memory index has been
+# swapped in. While False the gate_until_rag_ready middleware returns
+# 503 for every /api/* request (incl. /api/lab/summary), so the
+# multi-lab registry omits this lab from the LAB list. If paper_rag
+# failed to import we leave this False forever, by design — the lab
+# should drop out of the registry rather than serve degraded.
+_rag_ready: bool = False
+
 
 @app.on_event("startup")
 async def _preload_rag():
@@ -758,6 +790,19 @@ async def _start_rag_rebuild_worker():
         return
     _rag_rebuild_queue = asyncio.Queue()
     asyncio.create_task(_rag_rebuild_worker())
+
+
+@app.on_event("startup")
+async def _enqueue_startup_rebuild():
+    """Force a fresh build_paper_index.py run on every server start, and
+    keep /api/* gated behind 503 until it finishes. Ordering: this runs
+    after _start_rag_rebuild_worker, so the queue and worker exist by
+    the time we put_nowait()."""
+    if _paper_rag is None:
+        # Stay un-ready forever — the gate middleware will 503 every
+        # /api/* call so the proxy registry drops this lab.
+        return
+    _enqueue_rag_rebuild("startup")
 
 
 async def _do_rag_rebuild_once(trigger: str) -> bool:
@@ -823,16 +868,28 @@ def _enqueue_rag_rebuild(trigger: str) -> None:
 
 async def _rag_rebuild_worker() -> None:
     """Single consumer of the rebuild queue. Runs forever; one rebuild +
-    swap per dequeued trigger, strict FIFO."""
+    swap per dequeued trigger, strict FIFO. The first time the
+    "startup" trigger is processed, flip _rag_ready True so the
+    gate middleware lets /api/* through — regardless of build success,
+    since failure leaves the previous on-disk index in place and we
+    prefer "serve with stale index" over "block forever"."""
+    global _rag_ready
     logger.info("rag rebuild worker: started")
     while True:
         trigger = await _rag_rebuild_queue.get()
         try:
-            await _do_rag_rebuild_once(trigger)
+            ok = await _do_rag_rebuild_once(trigger)
         except Exception:
             logger.exception("rag rebuild worker: pass for %s raised", trigger)
+            ok = False
         finally:
             _rag_rebuild_queue.task_done()
+        if trigger == "startup" and not _rag_ready:
+            _rag_ready = True
+            logger.info(
+                "rag rebuild worker: startup pass done (ok=%s); /api/* unblocked",
+                ok,
+            )
 
 
 @app.on_event("startup")
