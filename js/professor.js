@@ -4,7 +4,13 @@
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { ensureUser, getAuthHeaders } from "./auth.js";
+import {
+  ensureGoogleSignIn,
+  signInWithLab,
+  getAuthHeaders,
+  getUserIdMap,
+  clearStoredSession,
+} from "./auth.js";
 
 // AbortError is our expected control-flow signal whenever the user pauses
 // (Speak), raises a hand, or navigates mid-speech. It's caught at every
@@ -19,8 +25,12 @@ window.addEventListener("unhandledrejection", (event) => {
   }
 });
 
-// ---------- session id (filled in after Google Sign-In) ----------
-let USER_ID = null;
+// ---------- session ids (filled in after Google Sign-In) ----------
+// Each Lab keeps its own user registry, so we hold one user_id per Lab.
+// USER_IDS = { lab_id: user_id }. The `getAuthHeaders` helper turns the
+// map into a bundle of `X-User-Id-{lab_id}` headers; whichever Lab the
+// proxy routes the request to picks its own header off the bundle.
+let USER_IDS = {};
 let DISPLAY_NAME = null;
 
 // ---------- DOM ----------
@@ -42,7 +52,15 @@ const btnEnd = $("btn-end");
 const btnLogout = $("btn-logout");
 const inputQA = $("qa-input");
 const btnUpload = $("btn-upload");
+const btnMemo = $("btn-memo");
 const fileInput = $("file-paper");
+const memoOverlay = $("memo-overlay");
+const memoTitle = $("memo-title");
+const memoBody = $("memo-body");
+const memoTarget = $("memo-target");
+const memoStage = $("memo-stage");
+const memoCancel = $("memo-cancel");
+const memoSubmit = $("memo-submit");
 const elSlide = $("slide");
 const elSlideFrame = $("slide-frame");
 const uploadOverlay = $("upload-overlay");
@@ -196,7 +214,7 @@ function renderPage(idx) {
 
 // ---------- API ----------
 async function apiGet(path) {
-  const r = await fetch(path, { headers: getAuthHeaders(USER_ID) });
+  const r = await fetch(path, { headers: getAuthHeaders(USER_IDS) });
   if (!r.ok) throw new Error(`${path} → ${r.status}`);
   return r.json();
 }
@@ -213,13 +231,24 @@ function activeLabForStage(_stage) {
   return singleSelectedLab();
 }
 
-async function chat({ stage, slide = null, message = "", operatorId = null }) {
+async function chat({ stage, slide = null, message = "", operatorId = null, groupId = "" }) {
   const opId = operatorId ?? activeLabForStage(stage);
-  const body = { user_id: USER_ID, stage, message };
+  // /api/chat reads user_id from the body (not the header), so we must
+  // send the uid that belongs to whichever Lab opId routes to.
+  const labId = labState.labIdByOpId[opId] || null;
+  const uid = labId ? USER_IDS[labId] : null;
+  if (!uid) {
+    throw new Error(`/api/chat aborted: no auth for lab op=${opId} lab=${labId || "?"}`);
+  }
+  const body = { user_id: uid, stage, message };
   if (slide) body.slide = slide;
+  // Multi-Lab fan-out: same group_id sent to every Lab so the timeline
+  // can re-mark ★ best across the group on reload (the in-memory badge
+  // is otherwise lost with the page).
+  if (groupId) body.group_id = groupId;
   const r = await fetch(withLab("/api/chat", opId), {
     method: "POST",
-    headers: getAuthHeaders(USER_ID),
+    headers: getAuthHeaders(USER_IDS),
     body: JSON.stringify(body),
   });
   if (!r.ok) {
@@ -442,7 +471,7 @@ async function speakChunk(text, voice) {
   try {
     resp = await fetch(ttsUrl, {
       method: "POST",
-      headers: getAuthHeaders(USER_ID),
+      headers: getAuthHeaders(USER_IDS),
       body: JSON.stringify({
         gender: voice || "male",
         style: "neutral",
@@ -864,8 +893,47 @@ const elLabsCount = document.getElementById("labs-count");
 // even if the dropdown is rendered before the next refreshLabs tick.
 const labState = {
   selectedLabIds: new Set(),
-  labels: {},   // operator_id -> human label
+  labels: {},        // operator_id -> human label
+  labIdByOpId: {},   // operator_id -> lab_id (used to pick the right uid)
+  // Per-Lab auth status, keyed by operator_id:
+  //   "pending" — sign-in attempt in flight
+  //   "ok"      — Google sign-in registered/verified on that Lab
+  //   "failed"  — Lab rejected (e.g. domain not allowed) or unreachable
+  // Only "ok" Labs are selectable in the GUI; the rest stay visible but
+  // grayed-out so the user can see they exist without being able to
+  // dispatch QA fan-outs that would just 401.
+  authStatus: {},
 };
+
+// Promises so concurrent refreshLabs ticks don't double-fire signInWithLab
+// for the same op while an attempt is in flight.
+const _labAuthInFlight = {};
+
+function _kickLabAuth(opId, labId) {
+  if (!opId || !labId) return;
+  if (_labAuthInFlight[opId]) return;
+  if (labState.authStatus[opId] === "ok") return;
+  labState.authStatus[opId] = "pending";
+  _labAuthInFlight[opId] = (async () => {
+    try {
+      const res = await signInWithLab({ opId, labId });
+      if (res && res.userId) {
+        USER_IDS[labId] = res.userId;
+        if (res.displayName && !DISPLAY_NAME) DISPLAY_NAME = res.displayName;
+        labState.authStatus[opId] = "ok";
+        return true;
+      }
+      labState.authStatus[opId] = "failed";
+      return false;
+    } catch (e) {
+      console.warn(`[lab-auth] sign-in failed op=${opId} lab=${labId}:`, e.message);
+      labState.authStatus[opId] = "failed";
+      return false;
+    } finally {
+      delete _labAuthInFlight[opId];
+    }
+  })();
+}
 
 // Append operator_id=<id> to a /api/* path so the proxy routes the request
 // to that Lab's tunnel. Pass the operator_id explicitly — callers either
@@ -909,48 +977,140 @@ for (const panel of document.querySelectorAll("#side .panel[data-collapsible]"))
 }
 
 async function heartbeat() {
-  try {
-    await fetch("/api/presence/heartbeat", {
-      method: "POST",
-      headers: getAuthHeaders(USER_ID),
-      body: JSON.stringify({ user_id: USER_ID }),
-    });
-  } catch (e) {
-    console.warn("[presence] heartbeat failed:", e.message);
+  // Multi-Lab presence: send one heartbeat per authenticated Lab, each
+  // carrying that Lab's own user_id in the body and routed via
+  // ?operator_id= so it lands on the right backend. Without explicit
+  // routing the proxy would default-route them all to one Lab and the
+  // others would mark us as gone.
+  const targets = [];
+  for (const [opId, labId] of Object.entries(labState.labIdByOpId)) {
+    const uid = USER_IDS[labId];
+    if (uid) targets.push({ opId, uid });
   }
+  if (!targets.length) return;
+  await Promise.all(targets.map(async ({ opId, uid }) => {
+    try {
+      await fetch(withLab("/api/presence/heartbeat", opId), {
+        method: "POST",
+        headers: getAuthHeaders(USER_IDS),
+        body: JSON.stringify({ user_id: uid }),
+      });
+    } catch (e) {
+      console.warn(`[presence] heartbeat failed (op=${opId}):`, e.message);
+    }
+  }));
+}
+
+function _isMe(uid) {
+  // With one user_id per Lab, "me" is anyone whose uid matches *any*
+  // entry in our per-Lab map.
+  if (!uid) return false;
+  for (const v of Object.values(USER_IDS)) {
+    if (v === uid) return true;
+  }
+  return false;
 }
 
 async function refreshParticipants() {
-  try {
-    const r = await fetch("/api/presence/users", { headers: getAuthHeaders(USER_ID) });
-    if (!r.ok) return;
-    const data = await r.json();
-    elParticipantsCount.textContent = data.count;
+  // Fan-out: each Lab keeps its own participants list with its own per-Lab
+  // user_ids, so the same Google account shows up as a different uid on
+  // every Lab. Pull from every authed Lab in parallel and merge by
+  // email_local (Google's stable identity prefix) — falling back to
+  // display_name + uid when a Lab somehow stripped the email.
+  const targets = Object.entries(labState.labIdByOpId)
+    .filter(([opId]) => labState.authStatus[opId] === "ok")
+    .map(([opId]) => opId);
+  if (!targets.length) {
+    elParticipantsCount.textContent = "0";
     elParticipantsList.innerHTML = "";
-    for (const u of data.users) {
-      const row = document.createElement("div");
-      const cls = ["user-row"];
-      if (u.user_id === USER_ID) cls.push("me");
-      if (!u.online) cls.push("offline");
-      row.className = cls.join(" ");
-
-      const dot = document.createElement("div"); dot.className = "dot";
-
-      const wrap = document.createElement("div"); wrap.className = "name-wrap";
-      const name = document.createElement("div"); name.className = "name";
-      name.textContent = u.display_name || u.user_id.slice(0, 8);
-      wrap.appendChild(name);
-      if (u.email_local) {
-        const sub = document.createElement("div");
-        sub.className = "name-sub";
-        sub.textContent = `(${u.email_local})`;
-        wrap.appendChild(sub);
-      }
-      row.append(dot, wrap);
-      elParticipantsList.appendChild(row);
+    return;
+  }
+  const responses = await Promise.all(targets.map(async (opId) => {
+    try {
+      const r = await fetch(
+        withLab("/api/presence/users", opId),
+        { headers: getAuthHeaders(USER_IDS) },
+      );
+      if (!r.ok) return null;
+      return await r.json();
+    } catch (e) {
+      console.warn(`[presence] users fetch failed (op=${opId}):`, e.message);
+      return null;
     }
-  } catch (e) {
-    console.warn("[presence] users fetch failed:", e.message);
+  }));
+
+  // Identity merge: same email_local => same person across Labs.
+  // Merge rules:
+  //   online   = OR across Labs (online on any one ⇒ shown online)
+  //   joined_at = min  (earliest join wins)
+  //   last_seen = max  (most recent ping wins)
+  //   qa_count = sum   (questions across all Labs the user used)
+  //   user_ids = the per-Lab uids we saw, used by _isMe to mark "me".
+  const merged = new Map();   // key -> aggregated row
+  for (const data of responses) {
+    if (!data || !Array.isArray(data.users)) continue;
+    for (const u of data.users) {
+      const key = u.email_local
+        ? `email:${u.email_local}`
+        : `uid:${u.user_id}`;
+      const cur = merged.get(key);
+      if (!cur) {
+        merged.set(key, {
+          email_local: u.email_local || "",
+          display_name: u.display_name || u.user_id.slice(0, 8),
+          online: !!u.online,
+          joined_at: u.joined_at || 0,
+          last_seen: u.last_seen || 0,
+          qa_count: u.qa_count || 0,
+          user_ids: [u.user_id],
+        });
+      } else {
+        cur.online = cur.online || !!u.online;
+        if (u.joined_at && (!cur.joined_at || u.joined_at < cur.joined_at)) {
+          cur.joined_at = u.joined_at;
+        }
+        if (u.last_seen && u.last_seen > cur.last_seen) {
+          cur.last_seen = u.last_seen;
+        }
+        cur.qa_count += (u.qa_count || 0);
+        if (!cur.user_ids.includes(u.user_id)) cur.user_ids.push(u.user_id);
+        if (!cur.display_name && u.display_name) cur.display_name = u.display_name;
+      }
+    }
+  }
+
+  const rows = Array.from(merged.values()).sort((a, b) => a.joined_at - b.joined_at);
+  const onlineCount = rows.filter((r) => r.online).length;
+  elParticipantsCount.textContent = `${onlineCount}/${rows.length}`;
+  elParticipantsList.innerHTML = "";
+  for (const u of rows) {
+    const row = document.createElement("div");
+    const cls = ["user-row"];
+    if (u.user_ids.some((id) => _isMe(id))) cls.push("me");
+    if (!u.online) cls.push("offline");
+    row.className = cls.join(" ");
+
+    const dot = document.createElement("div"); dot.className = "dot";
+
+    const wrap = document.createElement("div"); wrap.className = "name-wrap";
+    const name = document.createElement("div"); name.className = "name";
+    name.textContent = u.display_name;
+    wrap.appendChild(name);
+    if (u.email_local) {
+      const sub = document.createElement("div");
+      sub.className = "name-sub";
+      sub.textContent = `(${u.email_local})`;
+      wrap.appendChild(sub);
+    }
+    // 3rd line: how many Labs this person is authenticated against.
+    // user_ids.length counts per-Lab uids we saw across the merged
+    // responses — i.e. one entry per Lab that has them registered.
+    const labsLine = document.createElement("div");
+    labsLine.className = "name-sub";
+    labsLine.textContent = `認証済み Lab: ${u.user_ids.length}`;
+    wrap.appendChild(labsLine);
+    row.append(dot, wrap);
+    elParticipantsList.appendChild(row);
   }
 }
 
@@ -962,6 +1122,15 @@ function renderQaItem(item) {
   // the dataset key globally unique within the merged DOM.
   div.dataset.qaId = `${item._opId}:${item.qa_id}`;
   div.dataset.opId = item._opId || "";
+  // group_id correlates fan-out responses across Labs; recomputeBestBadges
+  // groups by it and marks the highest-scoring item ★ best. Same scoring
+  // formula as the server-less prior implementation:
+  //   score = top_score * 1.0 + (answer_len / 1000) * 0.1
+  // top_score (RAG match strength) dominates; answer length only breaks
+  // ties. Stash the inputs on the element so the recompute is data-only.
+  div.dataset.groupId = item.group_id || "";
+  div.dataset.topScore = String(Number(item.accuracy?.top_score) || 0);
+  div.dataset.answerLen = String((item.answer || "").length);
 
   const meta = document.createElement("div");
   meta.className = "meta";
@@ -1022,38 +1191,108 @@ function renderQaItem(item) {
   return div;
 }
 
+// Mutex: fanOutQa awaits refreshQaTimeline right after a question is sent,
+// but pollOnce also fires it on a 10s tick. Without a lock, two concurrent
+// calls both read the same pre-update lastQaIdByLab[opId] as `start`, both
+// fetch the same items, and both append → visible duplicates in the DOM.
+let _qaRefreshInFlight = null;
 async function refreshQaTimeline() {
-  // Per-Lab fan-out + merge by ts. With multi-select, each Lab keeps its
-  // own qa_id sequence and own /api/qa/timeline; the GUI fetches each in
-  // parallel, decorates items with their owning op_id, and inserts them
-  // into the merged DOM in chronological order.
-  const labs = Array.from(labState.selectedLabIds);
-  if (!labs.length) return;
-  const fetched = await Promise.all(labs.map(async (opId) => {
-    try {
-      const start = lastQaIdByLab[opId] || 0;
-      const url = withLab(
-        `/api/qa/timeline?start=${start}&end=-1&limit=50`, opId);
-      const r = await fetch(url, { headers: getAuthHeaders(USER_ID) });
-      if (!r.ok) return [];
-      const data = await r.json();
-      const items = (data.items || []).map((it) => ({ ...it, _opId: opId }));
-      for (const it of items) {
-        lastQaIdByLab[opId] = Math.max(lastQaIdByLab[opId] || 0, it.qa_id);
+  if (_qaRefreshInFlight) return _qaRefreshInFlight;
+  _qaRefreshInFlight = (async () => {
+    // Per-Lab fan-out + merge by ts. With multi-select, each Lab keeps its
+    // own qa_id sequence and own /api/qa/timeline; the GUI fetches each in
+    // parallel, decorates items with their owning op_id, and inserts them
+    // into the merged DOM in chronological order.
+    const labs = Array.from(labState.selectedLabIds);
+    if (!labs.length) return;
+    const fetched = await Promise.all(labs.map(async (opId) => {
+      try {
+        const start = lastQaIdByLab[opId] || 0;
+        const url = withLab(
+          `/api/qa/timeline?start=${start}&end=-1&limit=50`, opId);
+        const r = await fetch(url, { headers: getAuthHeaders(USER_IDS) });
+        if (!r.ok) return [];
+        const data = await r.json();
+        const items = (data.items || []).map((it) => ({ ...it, _opId: opId }));
+        for (const it of items) {
+          lastQaIdByLab[opId] = Math.max(lastQaIdByLab[opId] || 0, it.qa_id);
+        }
+        return items;
+      } catch (e) {
+        console.warn(`[qa] timeline fetch failed for op=${opId}:`, e.message);
+        return [];
       }
-      return items;
-    } catch (e) {
-      console.warn(`[qa] timeline fetch failed for op=${opId}:`, e.message);
-      return [];
+    }));
+    const allNew = fetched.flat().sort((a, b) => a.ts - b.ts);
+    if (!allNew.length) return;
+    const empty = elQaBody.querySelector(".empty");
+    if (empty) empty.remove();
+    for (const item of allNew) {
+      // Belt-and-suspenders: even with the mutex, a stale fanOutQa→star
+      // tagging path could still try to render an item already in the DOM
+      // if the user re-asks before the previous call's mutex releases on
+      // network failure. Skip if the composite key already exists.
+      const key = `${item._opId}:${item.qa_id}`;
+      if (elQaBody.querySelector(
+            `.qa-item[data-qa-id="${CSS.escape(key)}"]`)) continue;
+      elQaBody.appendChild(renderQaItem(item));
     }
-  }));
-  const allNew = fetched.flat().sort((a, b) => a.ts - b.ts);
-  if (!allNew.length) return;
-  const empty = elQaBody.querySelector(".empty");
-  if (empty) empty.remove();
-  for (const item of allNew) elQaBody.appendChild(renderQaItem(item));
-  elQaBody.scrollTop = elQaBody.scrollHeight;
-  elQaCount.textContent = elQaBody.querySelectorAll(".qa-item:not(.empty)").length;
+    // Re-derive ★ best across every group_id currently in the DOM. This
+    // is what makes the badge survive reload: server returns group_id,
+    // we recompute, no in-memory state lost between page loads.
+    recomputeBestBadges();
+    elQaBody.scrollTop = elQaBody.scrollHeight;
+    elQaCount.textContent =
+      elQaBody.querySelectorAll(".qa-item:not(.empty)").length;
+  })();
+  try {
+    return await _qaRefreshInFlight;
+  } finally {
+    _qaRefreshInFlight = null;
+  }
+}
+
+// Walk every qa-item in the DOM, group by data-group-id, mark the
+// highest-scoring item per group as ★ best. Idempotent: re-running clears
+// stale badges from items that lost the lead (e.g. a late competing
+// response just landed). Single-Lab questions carry no group_id (or a
+// group of size 1) and are skipped — best only makes sense across rivals.
+function recomputeBestBadges() {
+  const groups = new Map();
+  for (const el of elQaBody.querySelectorAll(".qa-item:not(.empty)")) {
+    const gid = el.dataset.groupId;
+    if (!gid) continue;
+    const top = Number(el.dataset.topScore) || 0;
+    const len = Number(el.dataset.answerLen) || 0;
+    const score = top * 1.0 + (len / 1000) * 0.1;
+    if (!groups.has(gid)) groups.set(gid, []);
+    groups.get(gid).push({ el, score });
+  }
+  for (const arr of groups.values()) {
+    if (arr.length < 2) {
+      for (const x of arr) {
+        x.el.classList.remove("is-best");
+        x.el.querySelector(".best-badge")?.remove();
+      }
+      continue;
+    }
+    let best = arr[0];
+    for (const x of arr) if (x.score > best.score) best = x;
+    for (const x of arr) {
+      const isBest = (x === best);
+      x.el.classList.toggle("is-best", isBest);
+      const existing = x.el.querySelector(".best-badge");
+      if (isBest && !existing) {
+        const badge = document.createElement("span");
+        badge.className = "best-badge";
+        badge.textContent = "★ best";
+        badge.title = `score=${best.score.toFixed(3)}`;
+        x.el.querySelector(".meta")?.appendChild(badge);
+      } else if (!isBest && existing) {
+        existing.remove();
+      }
+    }
+  }
 }
 
 function _formatTimestamp(unix) {
@@ -1076,22 +1315,44 @@ async function refreshLabs() {
     elLabsCount.textContent = ops.length;
     elLabsList.innerHTML = "";
 
-    // Refresh the label cache so paperLibrary's optgroup labels stay in sync
-    // even if it's rendered between refreshLabs ticks.
+    // Refresh the label + lab_id caches so paperLibrary's optgroup labels
+    // stay in sync even if it's rendered between refreshLabs ticks, and so
+    // chat()/heartbeat() can map opId → lab_id → uid.
     const newLabels = {};
+    const newLabIdByOpId = {};
     for (const op of ops) {
       const lab = op.lab || {};
       newLabels[op.id] = lab.name || lab.lab_id || op.name || op.id?.slice(0, 6) || "Lab";
+      if (lab.lab_id) newLabIdByOpId[op.id] = lab.lab_id;
     }
     labState.labels = newLabels;
+    labState.labIdByOpId = newLabIdByOpId;
 
-    // Drop selections for Labs that disappeared.
+    // Per-Lab Google sign-in: try every visible Lab once. The Lab list
+    // is shown regardless of auth state, but a Lab the user couldn't
+    // authenticate to (e.g. it's offline now, or its users.json is
+    // gone) stays non-selectable below.
+    for (const op of ops) {
+      const labId = newLabIdByOpId[op.id];
+      if (!labId) continue;
+      _kickLabAuth(op.id, labId);
+    }
+
+    // Drop selections for Labs that disappeared OR are no longer
+    // authenticated (e.g. the user revoked / users.json wiped).
     let dropped = false;
     for (const id of Array.from(labState.selectedLabIds)) {
-      if (!ops.some((o) => o.id === id)) {
+      const stillThere = ops.some((o) => o.id === id);
+      const stillOk = labState.authStatus[id] === "ok";
+      if (!stillThere || !stillOk) {
         labState.selectedLabIds.delete(id);
         dropped = true;
       }
+    }
+    // Garbage-collect authStatus entries for Labs that disappeared so the
+    // dict doesn't grow unbounded across reconnects.
+    for (const opId of Object.keys(labState.authStatus)) {
+      if (!ops.some((o) => o.id === opId)) delete labState.authStatus[opId];
     }
 
     if (!ops.length) {
@@ -1108,12 +1369,27 @@ async function refreshLabs() {
       const trust = lab.trust || {};
       const row = document.createElement("div");
       row.className = "lab-row";
-      const isSel = labState.selectedLabIds.has(op.id);
+      const auth = labState.authStatus[op.id] || "pending";
+      // Only authed Labs get the click/select treatment. Pending +
+      // failed Labs are visible (so the user knows they exist) but the
+      // row is non-interactive and a tag explains why.
+      const interactive = (auth === "ok");
+      if (!interactive) row.classList.add("lab-no-auth");
+      if (auth === "pending") row.classList.add("lab-auth-pending");
+      if (auth === "failed") row.classList.add("lab-auth-failed");
+      const isSel = interactive && labState.selectedLabIds.has(op.id);
       if (isSel) row.classList.add("selected");
       row.dataset.operatorId = op.id || "";
-      row.tabIndex = 0;
-      row.setAttribute("role", "checkbox");
-      row.setAttribute("aria-checked", String(isSel));
+      if (interactive) {
+        row.tabIndex = 0;
+        row.setAttribute("role", "checkbox");
+        row.setAttribute("aria-checked", String(isSel));
+      } else {
+        row.setAttribute("aria-disabled", "true");
+        row.title = (auth === "pending")
+          ? "認証中…"
+          : "この Lab に Google サインインできませんでした（選択不可）";
+      }
 
       const head = document.createElement("div");
       head.className = "lab-head";
@@ -1129,6 +1405,12 @@ async function refreshLabs() {
       const chunks = trust.corpus_chunks ?? 0;
       stats.textContent = `📄 ${papers} / chunks ${chunks.toLocaleString()}`;
       head.append(check, dot, name, stats);
+      if (!interactive) {
+        const tag = document.createElement("span");
+        tag.className = "lab-auth-tag";
+        tag.textContent = (auth === "pending") ? "🔒 認証中…" : "🔒 未認証";
+        head.append(tag);
+      }
 
       const summary = document.createElement("div");
       summary.className = "lab-summary";
@@ -1141,14 +1423,16 @@ async function refreshLabs() {
       meta.textContent = `index ${updated} · ${model}`;
 
       row.append(head, summary, meta);
-      const onToggle = () => toggleLab(op.id);
-      row.addEventListener("click", onToggle);
-      row.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onToggle();
-        }
-      });
+      if (interactive) {
+        const onToggle = () => toggleLab(op.id);
+        row.addEventListener("click", onToggle);
+        row.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onToggle();
+          }
+        });
+      }
       elLabsList.appendChild(row);
     }
     if (dropped) refreshPaperLibrary();
@@ -1163,6 +1447,10 @@ async function refreshLabs() {
 // to the locked "Lab を選択してください" placeholder when the set is empty).
 function toggleLab(id) {
   if (!id) return;
+  // Defense in depth: refreshLabs already drops the click handler on
+  // un-authenticated rows, but a stale click could still fire during
+  // re-render — refuse the toggle if we don't have a uid for this Lab.
+  if (labState.authStatus[id] !== "ok") return;
   if (labState.selectedLabIds.has(id)) {
     labState.selectedLabIds.delete(id);
   } else {
@@ -1194,12 +1482,29 @@ function updateAskAvailability() {
   inputQA.disabled = !hasLab;
 }
 
+// Best-effort poll of /api/upload/eligibility so a ticket created on
+// another browser (e.g. ticket.html on the admin's phone) flips the
+// upload / delete / memo buttons live, without a full reload. Boot does
+// the initial fetch with explicit reset-on-error semantics; this poll
+// skips reset on transient errors to avoid UI flicker.
+async function refreshEligibilityForPoll() {
+  try {
+    const elig = await apiGet("/api/upload/eligibility");
+    applyEligibility({
+      upload: !!elig.upload,
+      remove: !!elig.remove,
+      technote: !!elig.technote,
+    });
+  } catch (_) { /* swallow — keep the last-known state */ }
+}
+
 async function pollOnce() {
   await Promise.all([
     heartbeat(),
     refreshParticipants(),
     refreshQaTimeline(),
     refreshLabs(),
+    refreshEligibilityForPoll(),
   ]);
 }
 
@@ -1373,8 +1678,14 @@ const QA_RESUME_TRANSITION_PHRASE = "それでは、発表を続けさせてい�
 async function fanOutQa(question, labs) {
   const slide = currentSlidePayload();
   setStatus(`asking ${labs.length} labs…`);
+  // Mint one UUID per Ask click so every Lab's response is tagged with
+  // the same group_id. The server persists it on the QA entry, the
+  // timeline echoes it back, and recomputeBestBadges re-derives ★ best
+  // from the group on every render — including after a page reload.
+  const groupId = (crypto.randomUUID && crypto.randomUUID())
+    || `g-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const results = await Promise.allSettled(labs.map((opId) =>
-    chat({ stage: "qa", slide, message: question, operatorId: opId })
+    chat({ stage: "qa", slide, message: question, operatorId: opId, groupId })
   ));
   const ok = results.filter((r) => r.status === "fulfilled").length;
   const failed = results.length - ok;
@@ -1382,44 +1693,13 @@ async function fanOutQa(question, labs) {
     ? `asked ${ok}/${labs.length} labs (${failed} failed)`
     : `asked ${ok}/${labs.length} labs ✓`);
 
-  // 各 Lab の応答を採点。primary は RAG の retrieval top-1 score
-  // (Lab の知識ベースと質問のマッチ度)。tiebreaker に reasoning 長
-  // (= 回答にどれだけ肉付けしたか) を弱い重みで足す。
-  let bestOpId = null;
-  let bestScore = -Infinity;
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    if (r.status !== "fulfilled") continue;
-    const data = r.value || {};
-    const acc = data.accuracy || {};
-    const top = Number(acc.top_score) || 0;
-    const len = (data.reply || "").length;
-    const score = top * 1.0 + (len / 1000) * 0.1;
-    if (score > bestScore) {
-      bestScore = score;
-      bestOpId = labs[i];
-    }
-  }
-
   // Pull the just-recorded items into the merged timeline immediately so
-  // the user doesn't wait the full 10s poll tick to see answers.
+  // the user doesn't wait the full 10s poll tick to see answers. The
+  // timeline render path now invokes recomputeBestBadges() itself, which
+  // walks every group_id present in the DOM and marks the highest-scoring
+  // item per group — so ★ best is derivable from server state alone and
+  // survives reload.
   await refreshQaTimeline();
-
-  // refreshQaTimeline() 後、lastQaIdByLab[opId] は今送った応答の qa_id を
-  // 指す (Lab ごとに新着 1 件のみ)。その composite key の DOM に ★ を付与。
-  if (bestOpId && lastQaIdByLab[bestOpId]) {
-    const key = `${bestOpId}:${lastQaIdByLab[bestOpId]}`;
-    const el = elQaBody.querySelector(
-      `.qa-item[data-qa-id="${CSS.escape(key)}"]`);
-    if (el && !el.querySelector(".best-badge")) {
-      el.classList.add("is-best");
-      const badge = document.createElement("span");
-      badge.className = "best-badge";
-      badge.textContent = "★ best";
-      badge.title = `score=${bestScore.toFixed(3)}`;
-      el.querySelector(".meta")?.appendChild(badge);
-    }
-  }
 }
 
 btnAsk.addEventListener("click", async () => {
@@ -1505,11 +1785,21 @@ btnLogout.addEventListener("click", async () => {
   if (!confirm("ログアウトしますか？")) return;
   cancelAuto();
   btnLogout.disabled = true;
+  // Fan-out logout to every authed Lab so each one drops us from its
+  // own participants/qa state (a single un-routed POST would only land
+  // on whichever Lab the proxy default-picks, leaving the others stuck
+  // showing us as still present until their PRESENCE_TIMEOUT elapses).
   try {
-    await fetch("/api/auth/logout", {
-      method: "POST",
-      headers: getAuthHeaders(USER_ID),
-    });
+    await Promise.allSettled(
+      Object.entries(labState.labIdByOpId)
+        .filter(([opId]) => labState.authStatus[opId] === "ok")
+        .map(([opId]) =>
+          fetch(withLab("/api/auth/logout", opId), {
+            method: "POST",
+            headers: getAuthHeaders(USER_IDS),
+          }),
+        ),
+    );
   } catch (e) {
     console.warn("logout request failed:", e.message);
   }
@@ -1517,8 +1807,7 @@ btnLogout.addEventListener("click", async () => {
     clearInterval(pollTimer);
     pollTimer = null;
   }
-  localStorage.removeItem("professor_user_id");
-  localStorage.removeItem("professor_display_name");
+  clearStoredSession();
   // Stop Google auto-sign-in so the next visit shows the picker fresh.
   if (typeof google !== "undefined" && google.accounts && google.accounts.id) {
     try { google.accounts.id.disableAutoSelect(); } catch (_) {}
@@ -1659,7 +1948,7 @@ async function applyGeneratedSlides(operatorId, jobId) {
   const url = withLab(`/api/upload/jobs/${encodeURIComponent(jobId)}/slides`, operatorId);
   let html;
   try {
-    const r = await fetch(url, { headers: getAuthHeaders(USER_ID) });
+    const r = await fetch(url, { headers: getAuthHeaders(USER_IDS) });
     if (!r.ok) throw new Error(`slides ${r.status}: ${await r.text()}`);
     html = await r.text();
   } catch (e) {
@@ -1703,7 +1992,7 @@ async function applyGeneratedSlides(operatorId, jobId) {
   try {
     const r = await fetch(
       withLab(`/api/upload/jobs/${encodeURIComponent(jobId)}/script`, operatorId),
-      { headers: getAuthHeaders(USER_ID) });
+      { headers: getAuthHeaders(USER_IDS) });
     if (r.ok) {
       const data = await r.json();
       state.scriptSlides = Array.isArray(data.slides) ? data.slides : null;
@@ -1876,7 +2165,7 @@ async function pollUploadJob(jobId) {
       `/api/upload/jobs/${encodeURIComponent(jobId)}?since=${uploadState.logOffset || 0}`,
       uploadState.operatorId);
     const r = await fetch(url, {
-      headers: getAuthHeaders(USER_ID),
+      headers: getAuthHeaders(USER_IDS),
     });
     if (!r.ok) throw new Error(`status ${r.status}`);
     const data = await r.json();
@@ -1960,9 +2249,10 @@ function stopUploadPolling() {
 // We stash the ticket flag on btnPaperDelete.dataset so the
 // per-selection updater (updatePaperButtons) re-applies both
 // constraints without needing to re-fetch eligibility.
-function applyEligibility({ upload = false, remove = false } = {}) {
-  // Stash both ticket flags on dataset so updatePaperButtons can reapply
-  // the (lab-selected ∧ ticket-ok) gate after Lab selection changes too.
+function applyEligibility({ upload = false, remove = false, technote = false } = {}) {
+  // Stash all three ticket flags on dataset so updatePaperButtons can
+  // reapply the (lab-selected ∧ ticket-ok) gate after Lab selection
+  // changes too.
   btnUpload.dataset.ticketOk = upload ? "1" : "";
   btnUpload.title = upload
     ? "論文PDFをアップロードしてスライド生成"
@@ -1971,6 +2261,12 @@ function applyEligibility({ upload = false, remove = false } = {}) {
   btnPaperDelete.title = remove
     ? "選択した論文を削除"
     : "論文削除はチケット (.ticket.remove) が必要です";
+  if (btnMemo) {
+    btnMemo.dataset.ticketOk = technote ? "1" : "";
+    btnMemo.title = technote
+      ? "技術メモ（テキスト）をRAGに追加"
+      : "技術メモ追加はチケット (.ticket.technote) が必要です";
+  }
   // Re-run the selection-aware enable/disable so dropdown + lab-selection
   // state is respected after the eligibility flip.
   if (typeof updatePaperButtons === "function") updatePaperButtons();
@@ -2029,7 +2325,7 @@ fileInput.addEventListener("change", async () => {
   try {
     const presignRes = await fetch(withLab("/api/upload/presign", targetLab), {
       method: "POST",
-      headers: getAuthHeaders(USER_ID),
+      headers: getAuthHeaders(USER_IDS),
       body: JSON.stringify({ filename: file.name }),
     });
     if (!presignRes.ok) {
@@ -2056,7 +2352,7 @@ fileInput.addEventListener("change", async () => {
 
     const startRes = await fetch(withLab("/api/upload/start", targetLab), {
       method: "POST",
-      headers: getAuthHeaders(USER_ID),
+      headers: getAuthHeaders(USER_IDS),
       body: JSON.stringify({ job_id: presign.job_id }),
     });
     if (!startRes.ok) {
@@ -2086,7 +2382,7 @@ fileInput.addEventListener("change", async () => {
     if (e.status === 403) {
       try {
         const elig = await apiGet("/api/upload/eligibility");
-        applyEligibility({ upload: !!elig.upload, remove: !!elig.remove });
+        applyEligibility({ upload: !!elig.upload, remove: !!elig.remove, technote: !!elig.technote });
       } catch (_) { /* best-effort */ }
     }
   }
@@ -2108,6 +2404,155 @@ uploadApply.addEventListener("click", () => {
   if (!uploadState.jobId || !uploadState.operatorId) return;
   applyGeneratedSlides(uploadState.operatorId, uploadState.jobId);
   hideUploadOverlay();
+});
+
+
+// ---------- tech-memo (pasted text) upload ----------
+//
+// Same control plane as the PDF upload (presign -> S3 PUT -> start) but
+// the body is a textarea instead of a file, the destination on the server
+// is EXTERNAL_TEXT_DIR/<safe>.md, and there's no slide pipeline / no
+// ticket gate. Success just enqueues a RAG rebuild — the next swap makes
+// the memo searchable in QA.
+
+const MEMO_MAX_BYTES = 1024 * 1024;   // matches server UPLOAD_TEXT_MAX_KB default
+
+function showMemoOverlay() { memoOverlay.classList.add("show"); }
+function hideMemoOverlay() { memoOverlay.classList.remove("show"); }
+
+function setMemoStage(text, kind) {
+  memoStage.textContent = text || "";
+  memoStage.classList.remove("done", "error");
+  if (kind) memoStage.classList.add(kind);
+}
+
+function setMemoBusy(busy) {
+  memoSubmit.disabled = !!busy;
+  memoCancel.disabled = !!busy;
+  memoTitle.disabled = !!busy;
+  memoBody.disabled = !!busy;
+}
+
+// Render the memo modal's send-target as "<DisplayName> (<UUID>)" — UUID
+// alone is unreadable when several Labs are connected. Falls back to just
+// the UUID if the labels cache hasn't populated yet (rare race with the
+// initial refreshLabs tick).
+function formatLabTarget(opId) {
+  const label = labState.labels[opId];
+  return label ? `${label} (${opId})` : opId;
+}
+
+btnMemo.addEventListener("click", () => {
+  const targetLab = singleSelectedLab();
+  if (!targetLab) {
+    alert("送信先の Lab を 1 つだけ選択してください");
+    return;
+  }
+  memoTarget.textContent = formatLabTarget(targetLab);
+  memoTitle.value = "";
+  memoBody.value = "";
+  setMemoStage("");
+  setMemoBusy(false);
+  showMemoOverlay();
+  setTimeout(() => memoTitle.focus(), 0);
+});
+
+memoCancel.addEventListener("click", () => {
+  hideMemoOverlay();
+});
+
+memoSubmit.addEventListener("click", async () => {
+  const targetLab = singleSelectedLab();
+  if (!targetLab) {
+    alert("送信先の Lab を 1 つだけ選択してください");
+    return;
+  }
+  const title = memoTitle.value.trim();
+  const body = memoBody.value;
+  if (!title) {
+    alert("タイトルを入力してください");
+    memoTitle.focus();
+    return;
+  }
+  if (!body.trim()) {
+    alert("本文を入力してください");
+    memoBody.focus();
+    return;
+  }
+  // UTF-8 byte length — string.length undercounts non-ASCII. Pre-flight
+  // here so the user sees the limit before we hit S3.
+  const bodyBytes = new TextEncoder().encode(body);
+  if (bodyBytes.byteLength > MEMO_MAX_BYTES) {
+    alert(`本文が大きすぎます（${bodyBytes.byteLength} bytes、上限 ${MEMO_MAX_BYTES} bytes）`);
+    return;
+  }
+
+  setMemoBusy(true);
+  setMemoStage("送信中…");
+  try {
+    const presignRes = await fetch(withLab("/api/upload/text/presign", targetLab), {
+      method: "POST",
+      headers: getAuthHeaders(USER_IDS),
+      body: JSON.stringify({ filename: title, title }),
+    });
+    if (!presignRes.ok) {
+      const detail = await _extractErrorMessage(presignRes);
+      const err = new Error(`presign ${presignRes.status}: ${detail}`);
+      err.status = presignRes.status;
+      err.detail = detail;
+      throw err;
+    }
+    const presign = await presignRes.json();
+
+    setMemoStage("アップロード中…");
+    const putRes = await fetch(presign.url, {
+      method: "PUT",
+      headers: { "Content-Type": "text/markdown; charset=utf-8" },
+      body: bodyBytes,
+    });
+    if (!putRes.ok) {
+      throw new Error(`s3 PUT ${putRes.status}: ${await putRes.text()}`);
+    }
+
+    setMemoStage("取り込み中…");
+    const startRes = await fetch(withLab("/api/upload/text/start", targetLab), {
+      method: "POST",
+      headers: getAuthHeaders(USER_IDS),
+      body: JSON.stringify({ job_id: presign.job_id, title }),
+    });
+    if (!startRes.ok) {
+      const detail = await _extractErrorMessage(startRes);
+      const err = new Error(`start ${startRes.status}: ${detail}`);
+      err.status = startRes.status;
+      err.detail = detail;
+      throw err;
+    }
+    setMemoStage("送信完了 — 管理者の RAG 再構築で反映されます", "done");
+    setMemoBusy(false);
+    // Auto-close after a short pause so the user sees the success state.
+    setTimeout(() => {
+      hideMemoOverlay();
+      setMemoStage("");
+    }, 1500);
+  } catch (e) {
+    console.error("[memo] upload failed:", e);
+    setMemoStage("失敗", "error");
+    setMemoBusy(false);
+    const msg = e.detail || e.message || String(e);
+    alert(`技術メモの送信に失敗しました:\n\n${msg}`);
+    // Ticket-eligibility 403: refresh per-action flags so the memo
+    // button half-opacity / tooltip catch up immediately.
+    if (e.status === 403) {
+      try {
+        const elig = await apiGet("/api/upload/eligibility");
+        applyEligibility({
+          upload: !!elig.upload,
+          remove: !!elig.remove,
+          technote: !!elig.technote,
+        });
+      } catch (_) { /* best-effort */ }
+    }
+  }
 });
 
 
@@ -2139,7 +2584,7 @@ async function refreshPaperLibrary(selectKey) {
   const results = await Promise.all(selectedIds.map(async (opId) => {
     try {
       const r = await fetch(withLab("/api/upload/papers", opId),
-                            { headers: getAuthHeaders(USER_ID) });
+                            { headers: getAuthHeaders(USER_IDS) });
       if (!r.ok) throw new Error(`status ${r.status}`);
       const data = await r.json();
       return { opId, papers: Array.isArray(data.papers) ? data.papers : [] };
@@ -2207,6 +2652,21 @@ function updatePaperButtons() {
       btnUpload.title = "論文PDFをアップロードしてスライド生成";
     }
   }
+  // Tech-memo upload: same single-Lab gate as PDF upload, plus a
+  // technote ticket (.ticket.technote) requirement.
+  const technoteTicket = btnMemo?.dataset.ticketOk === "1";
+  if (btnMemo) {
+    btnMemo.disabled = labCount !== 1 || !technoteTicket;
+    if (!technoteTicket) {
+      btnMemo.title = "技術メモ追加はチケット (.ticket.technote) が必要です";
+    } else if (labCount === 0) {
+      btnMemo.title = "送信先の Lab を 1 つ選択してください";
+    } else if (labCount > 1) {
+      btnMemo.title = "送信先 Lab を 1 つに絞ってください";
+    } else {
+      btnMemo.title = "技術メモ（テキスト）をRAGに追加";
+    }
+  }
 }
 
 paperLibrary.addEventListener("change", updatePaperButtons);
@@ -2217,7 +2677,7 @@ async function applyPaperById(operatorId, jobId) {
   cancelResume();
   const r = await fetch(
     withLab(`/api/upload/papers/${encodeURIComponent(jobId)}/select`, operatorId),
-    { method: "POST", headers: getAuthHeaders(USER_ID) },
+    { method: "POST", headers: getAuthHeaders(USER_IDS) },
   );
   if (!r.ok) throw new Error(`select ${r.status}: ${await r.text()}`);
   const data = await r.json();
@@ -2262,7 +2722,7 @@ btnPaperDelete.addEventListener("click", async () => {
     const r = await fetch(
       withLab(`/api/upload/papers/${encodeURIComponent(parsed.job_id)}`,
               parsed.operator_id),
-      { method: "DELETE", headers: getAuthHeaders(USER_ID) },
+      { method: "DELETE", headers: getAuthHeaders(USER_IDS) },
     );
     if (!r.ok) {
       lastStatus = r.status;
@@ -2294,7 +2754,7 @@ btnPaperDelete.addEventListener("click", async () => {
     if (lastStatus === 403) {
       try {
         const elig = await apiGet("/api/upload/eligibility");
-        applyEligibility({ upload: !!elig.upload, remove: !!elig.remove });
+        applyEligibility({ upload: !!elig.upload, remove: !!elig.remove, technote: !!elig.technote });
       } catch (_) { /* best-effort */ }
     }
   } finally {
@@ -2308,27 +2768,38 @@ btnPaperDelete.addEventListener("click", async () => {
   setStatus("認証中…");
   initAvatar();
 
-  const me = await ensureUser({});
-  if (!me || !me.userId) {
-    setStatus("認証に失敗しました（mixi.co.jp ドメインのみ許可）");
+  // Pop the Google picker once up-front so the user sees a clear "sign
+  // in" moment. The credential is then cached in-memory and replayed
+  // against each Lab as refreshLabs discovers them — successful Labs
+  // become selectable, failed Labs stay visible but locked.
+  const session = await ensureGoogleSignIn();
+  if (!session) {
+    setStatus("Google サインインに失敗しました");
     btnSpeak.disabled = true;
     return;
   }
-  USER_ID = me.userId;
-  DISPLAY_NAME = me.displayName;
-  console.log("[auth] signed in:", USER_ID, DISPLAY_NAME);
+  DISPLAY_NAME = session.displayName || DISPLAY_NAME;
+  // Seed USER_IDS from previously stored {lab_id: uid} pairs so a returning
+  // user can auth-check instead of re-registering on every Lab.
+  USER_IDS = getUserIdMap();
+  console.log("[auth] signed in:", session.email,
+    "labs cached:", Object.keys(USER_IDS));
 
-  // Paid actions (upload + delete) are each gated by a single-use
-  // ticket. Fetch both flags once at boot so the UI shows only the
-  // buttons this account can actually use. Any error treats the user
-  // as ineligible for both, since granting paid actions to a failed
-  // check would defeat the gate.
+  // Paid actions (upload + delete + technote) are each gated by a
+  // single-use ticket. Fetch all three flags once at boot so the UI
+  // shows only the buttons this account can actually use. Any error
+  // treats the user as ineligible for all of them, since granting paid
+  // actions to a failed check would defeat the gate.
   try {
     const elig = await apiGet("/api/upload/eligibility");
-    applyEligibility({ upload: !!elig.upload, remove: !!elig.remove });
+    applyEligibility({
+      upload: !!elig.upload,
+      remove: !!elig.remove,
+      technote: !!elig.technote,
+    });
   } catch (e) {
     console.warn("[ticket] eligibility check failed; hiding paid UI:", e);
-    applyEligibility({ upload: false, remove: false });
+    applyEligibility({ upload: false, remove: false, technote: false });
   }
 
   // Start the 10s presence/qa polling now that we have an authenticated id.

@@ -169,6 +169,14 @@ def classify_doc(path: Path, paper_dir: Path) -> dict:
         doc_type = "memo"
     elif top == "tools":
         doc_type = "tool"
+    elif top == "external-text-for-rag":
+        # Tech memos pasted via the GUI (HTML -> S3 -> server) land here as
+        # plain .md files; surface them as memos so QA can cite "user note".
+        doc_type = "memo"
+    elif top == "external-pdf-for-rag":
+        # User uploads mirrored from professor_data/uploads/ — same content
+        # type as the curated `paper/` tree, just a different ingestion path.
+        doc_type = "paper"
     else:
         doc_type = "other"
 

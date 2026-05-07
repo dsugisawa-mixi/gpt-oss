@@ -103,11 +103,34 @@ SLIDE_GEN_PYTHON = os.environ.get(
 SLIDE_NODE = os.environ.get("SLIDE_NODE", "node")
 UPLOAD_LOG_TAIL = int(os.environ.get("UPLOAD_LOG_TAIL", "200"))
 UPLOAD_PDF_MAX_MB = int(os.environ.get("UPLOAD_PDF_MAX_MB", "30"))
+# Tech-memo (pasted text) upload size cap. Memos are tiny by design — a
+# 1 MB limit cuts off accidental binary pastes / huge transcripts before
+# they reach disk.
+UPLOAD_TEXT_MAX_KB = int(os.environ.get("UPLOAD_TEXT_MAX_KB", "1024"))
 
 # Lab self-description (multi-lab fan-out): tunnel_client fetches
 # /api/lab/summary and forwards it to the proxy via update_operator. The
 # proxy's /api/tunnel/info exposes it to the GUI for trust-score ranking.
-LAB_ID = os.environ.get("LAB_ID", "")
+LAB_ID = os.environ.get("LAB_ID", "").strip()
+# LAB_ID is required: every browser request must address this Lab by
+# its own ``X-User-Id-{LAB_ID}`` header, and the browser derives that
+# suffix from the lab_id we publish in /api/lab/summary. The two must
+# match byte-for-byte, so we constrain LAB_ID to an HTTP-token-safe
+# subset rather than sanitize on both sides and risk drift.
+if not LAB_ID:
+    raise RuntimeError(
+        "LAB_ID environment variable is required (used as the per-Lab "
+        "auth header suffix X-User-Id-{LAB_ID})."
+    )
+if not all(
+    ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch in "_-"
+    for ch in LAB_ID
+):
+    raise RuntimeError(
+        f"LAB_ID={LAB_ID!r} contains characters outside [A-Za-z0-9_-]; "
+        "pick a token-safe value (it is used inside an HTTP header name)."
+    )
+LAB_USER_HEADER = f"X-User-Id-{LAB_ID}"
 LAB_NAME = os.environ.get("LAB_NAME", "")
 LAB_SUMMARY_TEXT = os.environ.get("LAB_SUMMARY", "")
 LAB_SUMMARY_MAX_CHARS = int(os.environ.get("LAB_SUMMARY_MAX_CHARS", "200"))
@@ -358,6 +381,11 @@ class ChatRequest(BaseModel):
     slide: Optional[SlideContent] = None
     voice: Optional[str] = None       # TTS voice override
     ephemeral: bool = False           # don't persist this turn
+    # Client-issued group identifier for multi-Lab fan-out. The GUI mints
+    # one UUID per Ask click and sends it to every Lab in parallel; the
+    # timeline echoes it back so the GUI can re-derive ★ best across the
+    # group on reload (the badge is otherwise lost with the page).
+    group_id: str = ""
 
 
 class ChatResponse(BaseModel):
@@ -406,6 +434,19 @@ class UploadPresignRequest(BaseModel):
 
 class UploadStartRequest(BaseModel):
     job_id: str
+
+
+class UploadTextPresignRequest(BaseModel):
+    # Browser-supplied filename hint (sanitized server-side). Optional
+    # because the textarea may be untitled; we fall back to the title or
+    # a UUID-derived stem.
+    filename: Optional[str] = None
+    title: Optional[str] = None
+
+
+class UploadTextStartRequest(BaseModel):
+    job_id: str
+    title: Optional[str] = None
 
 
 # =====================================================================
@@ -547,11 +588,14 @@ def _record_qa(
     slide_page: Optional[int],
     lab_id: str = "",
     accuracy: Optional[dict] = None,
+    group_id: str = "",
 ) -> dict:
     """Append one Q&A exchange under the asking user's record. The qa_id is
     process-globally unique within this Lab; it is NOT unique across Labs,
     so multi-Lab clients merge timelines by `ts`. lab_id + accuracy are
-    persisted so the merged GUI can label items and rank parallel answers."""
+    persisted so the merged GUI can label items and rank parallel answers.
+    group_id correlates fan-out responses across Labs (one UUID per Ask
+    click) so the GUI can re-mark ★ best after a reload."""
     global _qa_id_counter
     _qa_id_counter += 1
     rec = _touch_presence(user_id) or participants.get(user_id)
@@ -566,6 +610,7 @@ def _record_qa(
         "ts": time.time(),
         "lab_id": lab_id,
         "accuracy": accuracy or {},
+        "group_id": group_id or "",
     }
     if rec is not None:
         rec.setdefault("qa", []).append(entry)
@@ -590,12 +635,27 @@ def _find_qa(qa_id: int):
     return None, -1
 
 
+def _request_user_id(request: Request) -> Optional[str]:
+    """Read the per-Lab user_id header. Each Lab keeps its own user
+    registry, so the browser sends ``X-User-Id-{LAB_ID}: <uid>`` for
+    every Lab it has signed in to; this Lab only ever reads its own.
+    Header names are case-insensitive."""
+    v = request.headers.get(LAB_USER_HEADER)
+    if v:
+        return v
+    return request.headers.get(LAB_USER_HEADER.lower())
+
+
 def require_auth(request: Request) -> str:
-    """FastAPI dependency: require a valid X-User-Id header that resolves to
-    a registered user (i.e. one who passed Google sign-in + domain check)."""
-    uid = request.headers.get("X-User-Id") or request.headers.get("x-user-id")
+    """FastAPI dependency: require a valid ``X-User-Id-{LAB_ID}`` header
+    that resolves to a registered user (i.e. one who passed Google
+    sign-in + domain check on this Lab)."""
+    uid = _request_user_id(request)
     if not uid:
-        raise HTTPException(status_code=401, detail="missing X-User-Id header")
+        raise HTTPException(
+            status_code=401,
+            detail=f"missing {LAB_USER_HEADER} header",
+        )
     if uid not in _load_users():
         raise HTTPException(status_code=401, detail="unauthenticated")
     return uid
@@ -652,6 +712,7 @@ TICKET_CONSUMED_SUFFIX = ".ticket.consumed"
 TICKET_ACTION_SUFFIX = {
     "upload": ".ticket.available",
     "remove": ".ticket.remove",
+    "technote": ".ticket.technote",
 }
 
 
@@ -822,6 +883,10 @@ require_remove_ticket = _require_ticket_for(
     "remove",
     "no ticket: 論文削除用チケット (.ticket.remove) がありません",
 )
+require_technote_ticket = _require_ticket_for(
+    "technote",
+    "no ticket: 技術メモ追加用チケット (.ticket.technote) がありません",
+)
 
 
 def _verify_google_credential(credential: str) -> dict:
@@ -874,6 +939,17 @@ _rag_rebuild_queue: "asyncio.Queue[str]" = None  # initialized at startup
 # failed to import we leave this False forever, by design — the lab
 # should drop out of the registry rather than serve degraded.
 _rag_ready: bool = False
+
+
+@app.on_event("startup")
+async def _log_corpus_paths():
+    """Print the resolved external-corpus directories so deploy-time
+    "where did my upload go?" questions are answerable from `docker logs`
+    alone (vs. having to introspect env vars + Path.home())."""
+    logger.info("EXTERNAL_PDF_DIR  = %s (exists=%s)",
+                EXTERNAL_PDF_DIR, EXTERNAL_PDF_DIR.exists())
+    logger.info("EXTERNAL_TEXT_DIR = %s (exists=%s)",
+                EXTERNAL_TEXT_DIR, EXTERNAL_TEXT_DIR.exists())
 
 
 @app.on_event("startup")
@@ -1434,6 +1510,7 @@ async def chat(req: ChatRequest):
             slide_page=req.slide.page if req.slide else None,
             lab_id=LAB_ID,
             accuracy=accuracy,
+            group_id=(req.group_id or "").strip(),
         )
 
     # Touch presence on any chat call so an active speaker counts as online.
@@ -1639,8 +1716,8 @@ async def auth_check(
     lang: Optional[str] = None,
     difficulty: Optional[str] = None,  # accepted for compatibility; unused in LT
 ):
-    """Verify an existing session by user_id (X-User-Id header)."""
-    user_id = request.headers.get("X-User-Id") or request.headers.get("x-user-id")
+    """Verify an existing session by user_id (``X-User-Id-{LAB_ID}`` header)."""
+    user_id = _request_user_id(request)
     if not user_id:
         return JSONResponse({"detail": "no user"}, status_code=401)
     users = _load_users()
@@ -1826,7 +1903,15 @@ def _s3_client():
     global _s3_client_cached
     if _s3_client_cached is None:
         if not _aws_creds:
-            raise RuntimeError("AWS credentials not yet received from proxy")
+            # Surface as 503 (not 500) so the browser gets a retryable
+            # signal: this is a startup-race state, not a server bug.
+            # Affects every S3-touching endpoint (PDF presign, text-memo
+            # presign, S3 GET in the download paths) symmetrically.
+            raise HTTPException(
+                503,
+                "AWS 一時クレデンシャル未受領（プロキシからの STS リレー待ち）。"
+                "数秒～十数秒で復旧します。再試行してください。",
+            )
         # SigV4 + virtual-host addressing keeps the presigned URL clean
         # and forward-compatible with private-bucket policies.
         _s3_client_cached = boto3.client(
@@ -1849,6 +1934,24 @@ def _safe_pdf_name(raw: Optional[str]) -> str:
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
     return name
+
+
+def _safe_text_stem(raw: Optional[str], fallback: str = "memo") -> str:
+    """Sanitize an arbitrary title/filename hint into a filesystem-safe stem.
+    Used to derive both the S3 key and the on-disk .md filename for tech
+    memos. Strips path components and the .md/.txt extension if present so
+    the caller can append its own."""
+    base = Path(raw or "").name
+    base = re.sub(r"\.(md|markdown|txt)$", "", base, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[^A-Za-z0-9._\-]+", "_", base).strip("._-")
+    return cleaned or fallback
+
+
+def _safe_text_name(raw: Optional[str]) -> str:
+    """Produce a `<stem>.md` name suitable for an S3 key + final on-disk
+    file. Memos are stored as Markdown so the indexer parses them as
+    text rather than treating .txt + .md differently downstream."""
+    return _safe_text_stem(raw) + ".md"
 
 
 _TITLE_RE = re.compile(r"<title>\s*([^<]+?)\s*</title>", re.IGNORECASE | re.DOTALL)
@@ -2040,17 +2143,39 @@ KNOWLEDGE_CONTEXT_EXCLUDE_PREFIXES = [
     ).split(",") if s.strip()
 ]
 
-# Curated external corpus directory for related-work PDFs. We mirror
-# every uploaded paper into here right after it lands on disk so that
-# the next RAG index rebuild (auto-fired at the end of each pipeline)
-# picks it up — making it searchable as prior art for future uploads.
-# Without this mirror, the only copy lives under professor_data/uploads/
-# which is excluded from knowledge-context by KNOWLEDGE_CONTEXT_EXCLUDE_PREFIXES,
-# so a paper uploaded on day 1 would never surface as related work for
-# a paper uploaded on day 2 even though both are in the index.
+# Curated external corpus directories for related-work PDFs and pasted
+# tech-memo text. We mirror every uploaded paper / submitted memo into
+# here right after it lands on disk so the next RAG index rebuild
+# (auto-fired at the end of each pipeline) picks it up — making it
+# searchable as prior art for future uploads. Without this mirror, the
+# PDF copy only lives under professor_data/uploads/ which is excluded
+# from knowledge-context by KNOWLEDGE_CONTEXT_EXCLUDE_PREFIXES, so a
+# paper uploaded on day 1 would never surface as related work for a
+# paper uploaded on day 2 even though both are in the index.
+#
+# Defaulting: derive from PAPER_DIR (the indexer's walk root) when set so
+# the directories sit *inside* the bind-mount in container deploys —
+# Dockerfile sets PAPER_DIR=/app/paper, so the defaults resolve to
+# /app/paper/external-{pdf,text}-for-rag, which the host sees through
+# whatever it bind-mounts onto /app/paper. Without this derivation the
+# defaults would land at $HOME/git/paper/... = /root/git/paper/... inside
+# the container — outside any bind-mount, so writes silently disappear
+# into the overlay layer.
+def _default_external_corpus_dir(leaf: str) -> Path:
+    base = os.environ.get("PAPER_DIR", "").strip()
+    if base:
+        return Path(base) / leaf
+    return Path.home() / "git" / "paper" / leaf
+
+
 EXTERNAL_PDF_DIR = Path(os.environ.get(
     "EXTERNAL_PDF_DIR",
-    str(Path.home() / "git" / "paper" / "external-pdf-for-rag"),
+    str(_default_external_corpus_dir("external-pdf-for-rag")),
+))
+
+EXTERNAL_TEXT_DIR = Path(os.environ.get(
+    "EXTERNAL_TEXT_DIR",
+    str(_default_external_corpus_dir("external-text-for-rag")),
 ))
 
 
@@ -2559,11 +2684,12 @@ async def _run_slide_generation(job_id: str):
         job["status"] = "done"
         job["finished_at"] = time.time()
 
-        # Enqueue a RAG rebuild so the just-uploaded paper becomes
-        # searchable in QA. The single FIFO worker (_rag_rebuild_worker)
-        # processes triggers in arrival order — one rebuild + atomic
-        # swap per upload, no concurrency between rebuilds.
-        _enqueue_rag_rebuild(f"job:{job['job_id']}")
+        # No auto RAG rebuild here — admins fire one explicitly via
+        # POST /api/admin/rag-rebuild (ticket-admin GUI) once a batch of
+        # uploads is ready to be indexed. The corpus copy under
+        # EXTERNAL_TEXT_DIR is already in place from
+        # _stash_upload_to_external_corpus, so the next admin-triggered
+        # rebuild will pick it up.
     except Exception as e:
         logger.exception("slide generation failed")
         job["status"] = "error"
@@ -2620,6 +2746,10 @@ async def upload_presign(req: UploadPresignRequest, uid: str = Depends(require_t
             ExpiresIn=S3_PRESIGN_TTL_S,
             HttpMethod="PUT",
         )
+    except HTTPException:
+        # Already a clean 503/4xx (e.g. creds-not-yet-relayed) — don't
+        # rewrap into a generic 500.
+        raise
     except Exception as e:
         logger.exception("presign failed")
         raise HTTPException(500, f"presign failed: {e}")
@@ -2677,9 +2807,10 @@ async def _download_from_s3(job_id: str):
         )
         job["pdf_path"] = pdf_path
         job["log"].append(f"[s3] downloaded {safe_name} ({size} bytes)")
-        # Mirror into the curated external corpus dir BEFORE the
-        # pipeline runs — the auto-rebuild fired at the end of
-        # _run_slide_generation will then include it.
+        # Mirror into the curated external corpus dir so the next admin
+        # -triggered RAG rebuild (POST /api/admin/rag-rebuild) picks it
+        # up. No auto-rebuild fires after _run_slide_generation now —
+        # batching is the admin's call.
         _stash_upload_to_external_corpus(job, pdf_path)
     except Exception as e:
         logger.exception("s3 download failed")
@@ -2703,18 +2834,20 @@ async def _download_from_s3(job_id: str):
 @app.get("/api/upload/eligibility")
 async def upload_eligibility(uid: str = Depends(require_auth)):
     """Frontend uses this to decide which paid UI to show. Returns one
-    eligibility flag per ticket action (currently `upload` and
-    `remove`) plus the email checked, so the UI can show/hide buttons
+    eligibility flag per ticket action (`upload`, `remove`, `technote`)
+    plus the email checked, so the UI can show/hide buttons
     independently and surface a meaningful "ticket required" hint.
 
     Top-level `eligible` is kept as an alias of `upload` for backward
     compat with the previous single-flag response shape."""
     upload_ok = _user_has_ticket(uid, "upload")
     remove_ok = _user_has_ticket(uid, "remove")
+    technote_ok = _user_has_ticket(uid, "technote")
     return {
         "eligible": upload_ok,           # legacy alias
         "upload": upload_ok,
         "remove": remove_ok,
+        "technote": technote_ok,
         "email": _user_email(uid),
     }
 
@@ -2743,6 +2876,179 @@ async def upload_start(req: UploadStartRequest, uid: str = Depends(require_ticke
     job["status"] = "queued"
     asyncio.create_task(_download_from_s3(req.job_id))
     return {"job_id": req.job_id, "status": "queued"}
+
+
+# Tech-memo (pasted text) upload — same S3 control plane as PDF upload but
+# the final destination is EXTERNAL_TEXT_DIR/<safe_stem>.md, no slide
+# pipeline. Gated by a single-use technote ticket (.ticket.technote);
+# presign does the soft pre-check, start atomically consumes one.
+# Flow:
+#   1. POST /api/upload/text/presign {filename, title?}
+#        -> {job_id, key, url}  (PUT URL with Content-Type: text/markdown)
+#   2. Browser PUTs the textarea body to S3.
+#   3. POST /api/upload/text/start {job_id, title?}
+#        -> {job_id, status}    (server consumes one .ticket.technote, then
+#           downloads from S3 and writes the .md into EXTERNAL_TEXT_DIR.
+#           A RAG rebuild is NOT auto-fired — admins trigger it explicitly
+#           via POST /api/admin/rag-rebuild from the ticket-admin GUI).
+@app.post("/api/upload/text/presign")
+async def upload_text_presign(
+    req: UploadTextPresignRequest,
+    uid: str = Depends(require_technote_ticket),
+):
+    # Prefer the supplied filename, then the title, then a UUID stem. If
+    # both filename and title sanitize to the empty fallback (e.g. an
+    # all-Japanese title — the regex strips non-ASCII), append the job_id
+    # so two such memos don't overwrite each other under "memo.md".
+    job_id = uuid.uuid4().hex[:12]
+    stem_hint = req.filename or req.title or ""
+    stem = _safe_text_stem(stem_hint)
+    if stem == "memo" and not stem_hint.strip().lower().startswith("memo"):
+        stem = f"memo_{job_id}"
+    safe_name = stem + ".md"
+    key = f"{S3_UPLOAD_PREFIX.lstrip('/')}{job_id}/{safe_name}"
+    try:
+        url = _s3_client().generate_presigned_url(
+            ClientMethod="put_object",
+            Params={
+                "Bucket": S3_UPLOAD_BUCKET,
+                "Key": key,
+                "ContentType": "text/markdown; charset=utf-8",
+            },
+            ExpiresIn=S3_PRESIGN_TTL_S,
+            HttpMethod="PUT",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("text presign failed")
+        raise HTTPException(500, f"presign failed: {e}")
+
+    upload_jobs[job_id] = {
+        "job_id": job_id,
+        "user_id": uid,
+        "kind": "text",
+        "filename": safe_name,
+        "title": (req.title or "").strip(),
+        "status": "awaiting_upload",
+        "log": [f"[presign] key={key}"],
+        "started_at": None,
+        "finished_at": None,
+        "s3_bucket": S3_UPLOAD_BUCKET,
+        "s3_key": key,
+        "dest_path": None,
+        "error": None,
+    }
+    return {"job_id": job_id, "key": key, "url": url, "filename": safe_name}
+
+
+@app.post("/api/upload/text/start")
+async def upload_text_start(
+    req: UploadTextStartRequest,
+    uid: str = Depends(require_technote_ticket),
+):
+    job = upload_jobs.get(req.job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.get("kind") != "text":
+        raise HTTPException(400, "job is not a text-memo job")
+    if job["status"] != "awaiting_upload":
+        raise HTTPException(409, f"job is in state={job['status']}")
+    # Single-use technote ticket: consume one .ticket.technote -> .ticket.consumed
+    # before kicking off ingest. Mirrors the upload_start race-safe pattern —
+    # require_technote_ticket is a soft pre-check, this rename commits.
+    email = _user_email(uid)
+    consumed = _consume_ticket_for(email, "technote")
+    if consumed is None:
+        raise HTTPException(
+            403,
+            f"no ticket: 技術メモ追加用チケット消費失敗（残数0 or 別リクエストが先取り） email={email}",
+        )
+    job["log"].append(
+        f"[ticket] consumed {consumed.name} (email={email}, action=technote)")
+    job["ticket_path"] = str(consumed)
+    if req.title and req.title.strip():
+        job["title"] = req.title.strip()
+    job["status"] = "queued"
+    asyncio.create_task(_ingest_text_from_s3(req.job_id))
+    return {"job_id": req.job_id, "status": "queued"}
+
+
+async def _ingest_text_from_s3(job_id: str):
+    """Pull the just-uploaded memo from S3, write it into EXTERNAL_TEXT_DIR
+    as Markdown, then drop the S3 copy. Mirrors _download_from_s3 but
+    skips the slide pipeline. The RAG index is NOT rebuilt here — admins
+    fire that explicitly via POST /api/admin/rag-rebuild once a batch of
+    memos is ready."""
+    job = upload_jobs.get(job_id)
+    if not job:
+        return
+    bucket = job["s3_bucket"]
+    key = job["s3_key"]
+    safe_name = job["filename"]
+
+    job["status"] = "downloading"
+    job["log"].append(f"[s3] get s3://{bucket}/{key}")
+
+    try:
+        max_bytes = UPLOAD_TEXT_MAX_KB * 1024
+        head = await asyncio.to_thread(
+            _s3_client().head_object, Bucket=bucket, Key=key,
+        )
+        size = int(head.get("ContentLength", 0))
+        if size > max_bytes:
+            job["status"] = "error"
+            job["error"] = f"memo exceeds {UPLOAD_TEXT_MAX_KB} KB ({size} bytes)"
+            job["finished_at"] = time.time()
+            return
+        obj = await asyncio.to_thread(
+            _s3_client().get_object, Bucket=bucket, Key=key,
+        )
+        body_bytes = obj["Body"].read()
+        text = body_bytes.decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.exception("text s3 download failed")
+        job["status"] = "error"
+        job["error"] = f"s3 download failed: {e}"
+        job["finished_at"] = time.time()
+        return
+
+    try:
+        EXTERNAL_TEXT_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = f"external text dir mkdir failed: {e}"
+        job["finished_at"] = time.time()
+        return
+
+    title = job.get("title") or _safe_text_stem(safe_name)
+    dest = EXTERNAL_TEXT_DIR / safe_name
+    # Prepend the title as an H1 so the indexer's classify_doc surfaces a
+    # readable name (path stem is used as the title field, but the body
+    # heading also helps when the memo shows up in a RAG hit excerpt).
+    header = f"# {title}\n\n" if title else ""
+    try:
+        dest.write_text(header + text, encoding="utf-8")
+    except Exception as e:
+        logger.exception("text write failed")
+        job["status"] = "error"
+        job["error"] = f"write failed: {e}"
+        job["finished_at"] = time.time()
+        return
+    job["dest_path"] = str(dest)
+    job["log"].append(f"[ingest] wrote {dest} ({dest.stat().st_size} bytes)")
+
+    try:
+        await asyncio.to_thread(
+            _s3_client().delete_object, Bucket=bucket, Key=key,
+        )
+    except Exception:
+        logger.warning("s3 delete failed for %s/%s", bucket, key)
+
+    job["status"] = "done"
+    job["finished_at"] = time.time()
+    # No auto RAG rebuild — admins trigger it explicitly via
+    # POST /api/admin/rag-rebuild from the ticket-admin GUI.
 
 
 @app.get("/api/upload/jobs/{job_id}")
@@ -2982,18 +3288,41 @@ async def list_tickets(
 @app.post("/api/ticket/", status_code=201)
 async def create_ticket(
     req: TicketCreateRequest,
+    response: Response,
     uid: str = Depends(require_ticket_admin),
 ):
     """Mint a new available ticket. Writes
     TICKETS_DIR/<uuid>.ticket.<suffix> with action+email+metadata in
-    the JSON so consumed tickets remain identifiable post-rename."""
+    the JSON so consumed tickets remain identifiable post-rename.
+
+    Admin actions piggy-back on this endpoint via action="rag-rebuild"
+    because the proxy doesn't forward PATCH and only /api/ticket/* paths
+    are in its allowlist. Email is still required for the audit trail."""
+    email = (req.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(400, "invalid email")
+    if req.action == "rag-rebuild":
+        if _paper_rag is None:
+            raise HTTPException(503, "paper_rag unavailable on this Lab")
+        if _rag_rebuild_queue is None:
+            raise HTTPException(503, "rebuild worker not yet started")
+        trigger = f"admin:{email}"
+        _enqueue_rag_rebuild(trigger)
+        logger.info(
+            "ticket-admin: rag-rebuild queued by %s (auth=%s)",
+            email, _user_email(uid) or uid,
+        )
+        response.status_code = 202
+        return {
+            "ok": True,
+            "action": "rag-rebuild",
+            "trigger": trigger,
+            "queue_depth": _rag_rebuild_queue.qsize(),
+        }
     if req.action not in TICKET_ACTION_SUFFIX:
         raise HTTPException(
             400, f"invalid action: {req.action!r} (expected one of {list(TICKET_ACTION_SUFFIX)})",
         )
-    email = req.email.strip().lower()
-    if not email or "@" not in email:
-        raise HTTPException(400, "invalid email")
     TICKETS_DIR.mkdir(parents=True, exist_ok=True)
     ticket_id = str(uuid.uuid4())
     suffix = TICKET_ACTION_SUFFIX[req.action]

@@ -3,8 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0d1226">
 <title>D.Sugisawa LT</title>
 <style>
+  :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; overflow: hidden; }
   body {
@@ -186,10 +189,15 @@
   .lab-row:focus { outline: none; border-color: #3a4870; }
   .lab-row.selected {
     border-color: #e94560;
-    background: rgba(233, 69, 96, 0.08);
+    /* Solid (not rgba) so a transparent fill can't let the panel bleed
+       through and turn this into pale-pink-with-white-text mojibake. */
+    background: #2a1426;
     box-shadow: 0 0 0 1px #e94560 inset;
   }
   .lab-row.selected .lab-name { color: #f5f5fa; }
+  .lab-row.selected .lab-summary { color: #d8bfc8; }
+  .lab-row.selected .lab-stats { color: #c89aa8; }
+  .lab-row.selected .lab-meta { color: #9e7c8a; }
   .lab-row .lab-head {
     display: flex; align-items: baseline; gap: 6px;
     margin-bottom: 4px;
@@ -518,6 +526,96 @@
   #upload-overlay button.primary:hover { background: #c73650; }
   #upload-overlay button:disabled { opacity: 0.4; cursor: not-allowed; }
 
+  /* Tech-memo paste modal — same skin as upload-overlay but with form
+     inputs instead of a streaming log. */
+  #memo-overlay {
+    position: fixed; inset: 0;
+    background: rgba(5,8,20,0.78);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    z-index: 200;
+    display: none;
+    align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  #memo-overlay.show { display: flex; }
+  #memo-overlay .panel {
+    background: #11192e;
+    border: 1px solid #2a3a5a;
+    border-radius: 12px;
+    width: min(680px, 100%);
+    max-height: 86vh;
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  #memo-overlay h3 {
+    padding: 14px 18px;
+    color: #f5f5fa; font-size: 1.05em;
+    border-bottom: 1px solid #1a2245;
+    display: flex; align-items: center; gap: 10px;
+  }
+  #memo-overlay h3 .stage {
+    margin-left: auto;
+    font-size: 0.78em; color: #98a0c0;
+    font-weight: 400;
+  }
+  #memo-overlay h3 .stage.error { color: #e94560; }
+  #memo-overlay h3 .stage.done  { color: #5ad08b; }
+  #memo-overlay .memo-target {
+    padding: 8px 18px;
+    color: #98a0c0; font-size: 0.82em;
+    border-bottom: 1px solid #1a2245;
+  }
+  #memo-overlay .memo-target b { color: #cfd5e6; }
+  #memo-overlay .memo-form {
+    flex: 1;
+    padding: 12px 18px;
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  #memo-overlay label {
+    color: #98a0c0; font-size: 0.82em;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  #memo-overlay input[type="text"],
+  #memo-overlay textarea {
+    background: #0b1124;
+    color: #e0e0e0;
+    border: 1px solid #2a3a5a;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 0.92em;
+    font-family: inherit;
+  }
+  #memo-overlay textarea {
+    min-height: 220px;
+    resize: vertical;
+    font-family: 'SFMono-Regular', Consolas, monospace;
+    font-size: 0.86em;
+    line-height: 1.5;
+  }
+  #memo-overlay input[type="text"]:focus,
+  #memo-overlay textarea:focus { outline: none; border-color: #e94560; }
+  #memo-overlay .memo-hint {
+    color: #6a7392; font-size: 0.76em;
+  }
+  #memo-overlay .actions {
+    padding: 10px 16px;
+    border-top: 1px solid #1a2245;
+    display: flex; gap: 8px; justify-content: flex-end;
+  }
+  #memo-overlay button {
+    padding: 6px 14px;
+    border-radius: 6px; border: 1px solid #2a3a5a;
+    background: #1e2a4a; color: #e0e0e0; cursor: pointer; font-size: 0.9em;
+  }
+  #memo-overlay button:hover { background: #2a3a5a; }
+  #memo-overlay button.primary {
+    background: #e94560; border-color: #e94560; color: #fff;
+  }
+  #memo-overlay button.primary:hover { background: #c73650; }
+  #memo-overlay button:disabled { opacity: 0.4; cursor: not-allowed; }
+
 </style>
 <script type="importmap">
 {
@@ -595,6 +693,7 @@
   <button id="btn-ask" disabled>Ask</button>
   <button id="btn-end" disabled>End</button>
   <button id="btn-upload" title="論文PDFをアップロードしてスライド生成" disabled>論文アップロード</button>
+  <button id="btn-memo" title="技術メモ（テキスト）をRAGに追加" disabled>技術メモ追加</button>
   <select id="paper-library" title="アップロード済み論文から選択">
     <option value="">アップロード済み論文…</option>
   </select>
@@ -614,6 +713,26 @@
     <div class="actions">
       <button id="upload-close" disabled>閉じる</button>
       <button id="upload-apply" class="primary" disabled>このスライドを使う</button>
+    </div>
+  </div>
+</div>
+
+<div id="memo-overlay">
+  <div class="panel">
+    <h3>技術メモを RAG に追加<span class="stage" id="memo-stage"></span></h3>
+    <div class="memo-target">送信先 Lab: <b id="memo-target">—</b></div>
+    <div class="memo-form">
+      <label>タイトル
+        <input type="text" id="memo-title" placeholder="例: QUIC 0-RTT のリプレイ対策メモ" maxlength="200" />
+      </label>
+      <label>本文（コピペ可・Markdown / プレーンテキスト）
+        <textarea id="memo-body" placeholder="ここに技術メモ本文を貼り付け…"></textarea>
+      </label>
+      <div class="memo-hint">最大 1 MB / UTF-8。 同名タイトルは上書きされます。</div>
+    </div>
+    <div class="actions">
+      <button id="memo-cancel">キャンセル</button>
+      <button id="memo-submit" class="primary">RAG へ追加</button>
     </div>
   </div>
 </div>
