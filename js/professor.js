@@ -1470,6 +1470,11 @@ function toggleLab(id) {
   refreshPaperLibrary();
   refreshQaTimeline();
   updateAskAvailability();
+  // Tickets are per-Lab, so a selection change means re-checking
+  // eligibility against the now-selected Lab (or clearing flags when
+  // the selection is 0 or >1, since the gated actions need exactly one
+  // target Lab anyway).
+  refreshEligibilityFor(singleSelectedLab());
 }
 
 // Ask は論文未適用でも、Lab が 1 つ以上選択されていれば許可する。
@@ -1482,14 +1487,23 @@ function updateAskAvailability() {
   inputQA.disabled = !hasLab;
 }
 
-// Best-effort poll of /api/upload/eligibility so a ticket created on
-// another browser (e.g. ticket.html on the admin's phone) flips the
-// upload / delete / memo buttons live, without a full reload. Boot does
-// the initial fetch with explicit reset-on-error semantics; this poll
-// skips reset on transient errors to avoid UI flicker.
-async function refreshEligibilityForPoll() {
+// Tickets live on each Lab's local TICKETS_DIR, so eligibility is per-Lab:
+// a ticket issued to Lab A is invisible from Lab B. We must route the
+// /api/upload/eligibility check to a specific Lab via ?operator_id=…;
+// without it the proxy default-routes (typically to the first registered
+// Lab) and a ticket on any other Lab silently looks "not eligible".
+//
+// The upload / memo / delete buttons all already require exactly one
+// selected Lab to act, so we mirror that gate here: fetch eligibility
+// only when singleSelectedLab() resolves; otherwise force flags off.
+// 0 / >1 selected Labs ⇒ ambiguous target ⇒ buttons stay disabled.
+async function refreshEligibilityFor(opId) {
+  if (!opId) {
+    applyEligibility({ upload: false, remove: false, technote: false });
+    return;
+  }
   try {
-    const elig = await apiGet("/api/upload/eligibility");
+    const elig = await apiGet(withLab("/api/upload/eligibility", opId));
     applyEligibility({
       upload: !!elig.upload,
       remove: !!elig.remove,
@@ -1504,7 +1518,7 @@ async function pollOnce() {
     refreshParticipants(),
     refreshQaTimeline(),
     refreshLabs(),
-    refreshEligibilityForPoll(),
+    refreshEligibilityFor(singleSelectedLab()),
   ]);
 }
 
@@ -2377,13 +2391,11 @@ fileInput.addEventListener("change", async () => {
     const msg = e.detail || e.message || String(e);
     alert(`アップロードに失敗しました:\n\n${msg}`);
     // If the failure was a ticket-eligibility 403, re-fetch eligibility
-    // so the button half-opacity / tooltip catch up immediately
-    // (otherwise the user could re-trigger and hit the same 403).
+    // against the Lab that just rejected so the button half-opacity /
+    // tooltip catch up immediately (otherwise the user could re-trigger
+    // and hit the same 403).
     if (e.status === 403) {
-      try {
-        const elig = await apiGet("/api/upload/eligibility");
-        applyEligibility({ upload: !!elig.upload, remove: !!elig.remove, technote: !!elig.technote });
-      } catch (_) { /* best-effort */ }
+      await refreshEligibilityFor(targetLab);
     }
   }
 });
@@ -2540,17 +2552,11 @@ memoSubmit.addEventListener("click", async () => {
     setMemoBusy(false);
     const msg = e.detail || e.message || String(e);
     alert(`技術メモの送信に失敗しました:\n\n${msg}`);
-    // Ticket-eligibility 403: refresh per-action flags so the memo
-    // button half-opacity / tooltip catch up immediately.
+    // Ticket-eligibility 403: refresh per-action flags against the
+    // Lab that just rejected so the memo button half-opacity / tooltip
+    // catch up immediately.
     if (e.status === 403) {
-      try {
-        const elig = await apiGet("/api/upload/eligibility");
-        applyEligibility({
-          upload: !!elig.upload,
-          remove: !!elig.remove,
-          technote: !!elig.technote,
-        });
-      } catch (_) { /* best-effort */ }
+      await refreshEligibilityFor(targetLab);
     }
   }
 });
@@ -2749,13 +2755,11 @@ btnPaperDelete.addEventListener("click", async () => {
     console.error("[library] delete failed:", e);
     const msg = e.detail || e.message || String(e);
     alert(`論文の削除に失敗しました:\n\n${msg}`);
-    // Ticket-eligibility 403: refresh the per-action flags so the
-    // delete button half-opacity / tooltip catch up immediately.
+    // Ticket-eligibility 403: refresh the per-action flags against the
+    // owning Lab so the delete button half-opacity / tooltip catch up
+    // immediately.
     if (lastStatus === 403) {
-      try {
-        const elig = await apiGet("/api/upload/eligibility");
-        applyEligibility({ upload: !!elig.upload, remove: !!elig.remove, technote: !!elig.technote });
-      } catch (_) { /* best-effort */ }
+      await refreshEligibilityFor(parsed.operator_id);
     }
   } finally {
     updatePaperButtons();
@@ -2786,21 +2790,11 @@ btnPaperDelete.addEventListener("click", async () => {
     "labs cached:", Object.keys(USER_IDS));
 
   // Paid actions (upload + delete + technote) are each gated by a
-  // single-use ticket. Fetch all three flags once at boot so the UI
-  // shows only the buttons this account can actually use. Any error
-  // treats the user as ineligible for all of them, since granting paid
-  // actions to a failed check would defeat the gate.
-  try {
-    const elig = await apiGet("/api/upload/eligibility");
-    applyEligibility({
-      upload: !!elig.upload,
-      remove: !!elig.remove,
-      technote: !!elig.technote,
-    });
-  } catch (e) {
-    console.warn("[ticket] eligibility check failed; hiding paid UI:", e);
-    applyEligibility({ upload: false, remove: false, technote: false });
-  }
+  // single-use ticket living on the targeted Lab. At boot no Lab is
+  // selected yet, so the gated buttons start disabled; toggleLab() and
+  // the 10s pollOnce() will route /api/upload/eligibility to whichever
+  // single Lab the user selects.
+  applyEligibility({ upload: false, remove: false, technote: false });
 
   // Start the 10s presence/qa polling now that we have an authenticated id.
   startPolling();
