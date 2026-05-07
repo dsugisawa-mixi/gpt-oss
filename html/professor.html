@@ -310,11 +310,24 @@
     background: #0b1124; border: 1px solid #1a2245;
     padding: 1px 6px; border-radius: 10px;
   }
+  /* sigmoid(mean_score) < WEAK_THRESHOLD のとき。reranker ロジットが
+     ほぼ判別不能 = RAG ヒットの根拠が弱いことを目立たせる。 */
+  .qa-item .meta .acc-badge.weak {
+    color: #1a1408; background: #f3c34a; border-color: #b48a1a;
+    font-weight: 700;
+  }
   /* multi-Lab fan-out で top_score×const + reasoning length が最も高かった
      回答を可視化する。同じ質問の競合 Lab のうち選ばれた一件のみに付く。 */
   .qa-item .meta .best-badge {
     color: #ffd266; font-size: 0.85em; font-weight: 700;
     background: #2a1f08; border: 1px solid #5a4520;
+    padding: 1px 6px; border-radius: 10px;
+  }
+  /* sigmoid(top_score) >= HIGH_SCORE_SIGMOID。reranker が単独で高信頼を
+     示した回答（単一 Lab 質問でも ★ が付かない場面で意味あり）。 */
+  .qa-item .meta .like-badge {
+    color: #5ad08b; font-size: 0.85em; font-weight: 700;
+    background: #0e2418; border: 1px solid #1f4a30;
     padding: 1px 6px; border-radius: 10px;
   }
   .qa-item.is-best { border-color: #5a4520; box-shadow: 0 0 0 1px rgba(255, 210, 102, 0.3); }

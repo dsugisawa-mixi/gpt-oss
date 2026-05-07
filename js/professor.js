@@ -33,6 +33,22 @@ window.addEventListener("unhandledrejection", (event) => {
 let USER_IDS = {};
 let DISPLAY_NAME = null;
 
+// ---------- score helpers ----------
+// RAG accuracy carries bge-reranker-v2-m3 raw logits (positive=relevant).
+// Sigmoid maps them to 0-1 confidence; below this threshold a hit is
+// roughly a coin flip on relevance, so the acc-badge turns yellow and ★
+// best is suppressed to avoid endorsing a weakly-grounded answer.
+// 0.6 は二つの観測点で校正:
+//   raw 0.06 → sigmoid 0.515 (要警告) / raw 0.77 → sigmoid 0.684 (★ 許容)
+// この間に閾値を置くことで「ほぼ判別不能」レベルの hit を弾きつつ、
+// reranker が中程度の確信を示した回答には ★ best を残す。
+const WEAK_SCORE_SIGMOID = 0.6;
+// それより上、reranker が単独で「高信頼」と判定した回答に 👍 を付ける。
+// ★ best と違い group_id を要求しないので、単一 Lab 質問でも機能する。
+// raw 0.77 → sigmoid 0.684 がギリギリ拾える位置。
+const HIGH_SCORE_SIGMOID = 0.65;
+const sigmoid = (x) => 1 / (1 + Math.exp(-x));
+
 // ---------- DOM ----------
 const $ = (id) => document.getElementById(id);
 const elTitle = $("talk-title");
@@ -336,7 +352,9 @@ function sanitizeForTTS(text) {
     // "Heavy check mark"). These are blanket ranges — anything in here
     // is non-textual decoration that breaks the reading flow.
     .replace(/[←-⇿]/g, " ")  // arrows
-    .replace(/[∀-⋿]/g, " ")  // mathematical operators (∑ ∏ ∫ ∈ ⊂ etc.)
+    // mathematical operators (∑ ∏ ∫ ∈ ⊂ etc.) — keep ≠ (U+2260) so the
+    // TTS-side dictionary entry ("ノットイコール") can fire.
+    .replace(/[∀-≟≡-⋿]/g, " ")
     .replace(/[⌀-⏿]/g, " ")  // miscellaneous technical
     .replace(/[␀-␿]/g, " ")  // control pictures
     .replace(/[─-╿]/g, " ")  // box drawing
@@ -1151,14 +1169,34 @@ function renderQaItem(item) {
   // Accuracy badge: server packs {rag_hits, top_score, mean_score}. We
   // surface mean_score (overall match) + hits count; top_score lives in
   // the tooltip for users who care about the strongest grounding chunk.
+  // Score = bge-reranker-v2-m3 raw logit (positive=relevant). Apply sigmoid
+  // for an intuitive 0-1 confidence; below WEAK_SCORE_SIGMOID we paint the
+  // badge yellow to flag weak grounding.
   const acc = item.accuracy || {};
   if (acc.rag_hits || acc.mean_score) {
     const ab = document.createElement("span");
     ab.className = "acc-badge";
-    const mean = (acc.mean_score || 0).toFixed(2);
-    ab.textContent = `🎯 ${mean} / ${acc.rag_hits || 0}`;
-    ab.title = `mean_score=${(acc.mean_score || 0).toFixed(3)}, top_score=${(acc.top_score || 0).toFixed(3)}, hits=${acc.rag_hits || 0}`;
+    const meanRaw = Number(acc.mean_score) || 0;
+    const topRaw = Number(acc.top_score) || 0;
+    const meanSig = sigmoid(meanRaw);
+    if (meanSig < WEAK_SCORE_SIGMOID) ab.classList.add("weak");
+    ab.textContent = `🎯 ${meanRaw.toFixed(2)} / ${acc.rag_hits || 0}`;
+    const topSig = sigmoid(topRaw);
+    ab.title =
+      `mean=${meanRaw.toFixed(3)} (sig ${meanSig.toFixed(2)}), ` +
+      `top=${topRaw.toFixed(3)} (sig ${topSig.toFixed(2)}), ` +
+      `hits=${acc.rag_hits || 0}` +
+      (meanSig < WEAK_SCORE_SIGMOID ? " — 根拠弱" : "");
     meta.append(ab);
+    // 👍 高信頼バッジ。★ best とは recomputeBestBadges で排他制御するので、
+    // ここではまず素直に付け、勝者になった時点で ★ に置き換える。
+    if (topSig >= HIGH_SCORE_SIGMOID) {
+      const lb = document.createElement("span");
+      lb.className = "like-badge";
+      lb.textContent = "👍";
+      lb.title = `高信頼: top sigmoid=${topSig.toFixed(2)}`;
+      meta.append(lb);
+    }
   }
   // Per-item Speak: only the user-clicked answer plays via TTS, never an
   // auto-play after fan-out. (Single-Lab path keeps its existing auto-TTS
@@ -1278,8 +1316,14 @@ function recomputeBestBadges() {
     }
     let best = arr[0];
     for (const x of arr) if (x.score > best.score) best = x;
+    // Suppress ★ when the winner's RAG grounding is weak (sigmoid(top_score)
+    // below threshold). A 0.06 raw logit ≈ 0.51 sigmoid — i.e. the reranker
+    // is essentially undecided — so calling that "best" misleads the user
+    // into trusting a hallucination-prone answer.
+    const bestTop = Number(best.el.dataset.topScore) || 0;
+    const bestIsWeak = sigmoid(bestTop) < WEAK_SCORE_SIGMOID;
     for (const x of arr) {
-      const isBest = (x === best);
+      const isBest = (x === best) && !bestIsWeak;
       x.el.classList.toggle("is-best", isBest);
       const existing = x.el.querySelector(".best-badge");
       if (isBest && !existing) {
@@ -1290,6 +1334,21 @@ function recomputeBestBadges() {
         x.el.querySelector(".meta")?.appendChild(badge);
       } else if (!isBest && existing) {
         existing.remove();
+      }
+      // ★ と 👍 が両方並ぶと冗長。★ が付く item からは 👍 を外し、
+      // ★ が外された item は score が条件を満たすなら 👍 を再付与する。
+      const like = x.el.querySelector(".like-badge");
+      if (isBest && like) {
+        like.remove();
+      } else if (!isBest && !like) {
+        const top = Number(x.el.dataset.topScore) || 0;
+        if (sigmoid(top) >= HIGH_SCORE_SIGMOID) {
+          const lb = document.createElement("span");
+          lb.className = "like-badge";
+          lb.textContent = "👍";
+          lb.title = `高信頼: top sigmoid=${sigmoid(top).toFixed(2)}`;
+          x.el.querySelector(".meta")?.appendChild(lb);
+        }
       }
     }
   }
