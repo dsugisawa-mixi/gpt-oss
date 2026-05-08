@@ -247,7 +247,7 @@ function activeLabForStage(_stage) {
   return singleSelectedLab();
 }
 
-async function chat({ stage, slide = null, message = "", operatorId = null, groupId = "" }) {
+async function chat({ stage, slide = null, message = "", operatorId = null, groupId = "", action = "", parts = null }) {
   const opId = operatorId ?? activeLabForStage(stage);
   // /api/chat reads user_id from the body (not the header), so we must
   // send the uid that belongs to whichever Lab opId routes to.
@@ -262,6 +262,12 @@ async function chat({ stage, slide = null, message = "", operatorId = null, grou
   // can re-mark ★ best across the group on reload (the in-memory badge
   // is otherwise lost with the page).
   if (groupId) body.group_id = groupId;
+  // Neutral aggregator path: action=aggregate + parts=[{answer,lab_id,score}].
+  // Server skips its own RAG and synthesizes the supplied answers, weighting
+  // by accuracy. Routed to the lowest-accuracy Lab in the group (low score =
+  // small RAG / off-topic for this Q ⇒ likely free capacity).
+  if (action) body.action = action;
+  if (parts && parts.length) body.parts = parts;
   const r = await fetch(withLab("/api/chat", opId), {
     method: "POST",
     headers: getAuthHeaders(USER_IDS),
@@ -901,6 +907,8 @@ const elParticipantsList = document.getElementById("participants-list");
 const elParticipantsCount = document.getElementById("participants-count");
 const elQaBody = document.getElementById("qa-body");
 const elQaCount = document.getElementById("qa-count");
+const elQaMaximize = document.getElementById("qa-maximize");
+const elQaBoardBody = document.getElementById("qa-board-body");
 const elLabsList = document.getElementById("labs-list");
 const elLabsCount = document.getElementById("labs-count");
 
@@ -1149,14 +1157,29 @@ function renderQaItem(item) {
   div.dataset.groupId = item.group_id || "";
   div.dataset.topScore = String(Number(item.accuracy?.top_score) || 0);
   div.dataset.answerLen = String((item.answer || "").length);
+  div.dataset.ts = String(Number(item.ts) || 0);
+  // Neutral-aggregator output. Marked so recomputeBestBadges skips it (the
+  // synthesis isn't a candidate, it's the merger) and renderQaItem can
+  // paint a 🧬 badge instead of the ★/👍 logic.
+  const isAggregated = !!item.accuracy?.aggregated;
+  if (isAggregated) div.dataset.aggregated = "1";
 
   const meta = document.createElement("div");
   meta.className = "meta";
   const labLabel = labState.labels[item._opId] || (item._opId || "").slice(0, 6) || "Lab";
   const badge = document.createElement("span");
   badge.className = "lab-badge";
-  badge.textContent = labLabel;
-  badge.title = `Lab: ${labLabel}`;
+  // Aggregated entries are routed through one Lab but conceptually belong
+  // to no single Lab — relabel as 統合 so the audience reads it as the
+  // synthesis, not as that Lab's own answer. The 🧬 badge still appears
+  // separately via the agg-badge path below.
+  if (isAggregated) {
+    badge.textContent = "統合";
+    badge.title = `統合 (via ${labLabel})`;
+  } else {
+    badge.textContent = labLabel;
+    badge.title = `Lab: ${labLabel}`;
+  }
   const who = document.createElement("span"); who.className = "who";
   who.textContent = item.display_name;
   const when = document.createElement("span");
@@ -1173,7 +1196,13 @@ function renderQaItem(item) {
   // for an intuitive 0-1 confidence; below WEAK_SCORE_SIGMOID we paint the
   // badge yellow to flag weak grounding.
   const acc = item.accuracy || {};
-  if (acc.rag_hits || acc.mean_score) {
+  if (isAggregated) {
+    const ag = document.createElement("span");
+    ag.className = "agg-badge";
+    ag.textContent = "🧬 統合";
+    ag.title = "中立 Aggregator による統合回答";
+    meta.append(ag);
+  } else if (acc.rag_hits || acc.mean_score) {
     const ab = document.createElement("span");
     ab.className = "acc-badge";
     const meanRaw = Number(acc.mean_score) || 0;
@@ -1282,6 +1311,7 @@ async function refreshQaTimeline() {
     elQaBody.scrollTop = elQaBody.scrollHeight;
     elQaCount.textContent =
       elQaBody.querySelectorAll(".qa-item:not(.empty)").length;
+    syncQaBoard();
   })();
   try {
     return await _qaRefreshInFlight;
@@ -1297,15 +1327,23 @@ async function refreshQaTimeline() {
 // group of size 1) and are skipped — best only makes sense across rivals.
 function recomputeBestBadges() {
   const groups = new Map();
+  // Track every item per group (including aggregated) so the 🧬 trigger
+  // placement can ask "does this group already have an aggregated entry?"
+  const groupHasAgg = new Map();
   for (const el of elQaBody.querySelectorAll(".qa-item:not(.empty)")) {
     const gid = el.dataset.groupId;
     if (!gid) continue;
+    if (el.dataset.aggregated === "1") {
+      groupHasAgg.set(gid, true);
+      continue;  // synthesis is not a ★-best candidate
+    }
     const top = Number(el.dataset.topScore) || 0;
     const len = Number(el.dataset.answerLen) || 0;
     const score = top * 1.0 + (len / 1000) * 0.1;
     if (!groups.has(gid)) groups.set(gid, []);
     groups.get(gid).push({ el, score });
   }
+  placeAggregateTriggers(groups, groupHasAgg);
   for (const arr of groups.values()) {
     if (arr.length < 2) {
       for (const x of arr) {
@@ -1352,6 +1390,176 @@ function recomputeBestBadges() {
       }
     }
   }
+}
+
+// Per-group 🧬 trigger. Render once on the highest-scoring (★) item of a
+// multi-Lab group so the user has an obvious next-step affordance after the
+// fan-out lands. Hidden once the group already contains an aggregated reply.
+function placeAggregateTriggers(groups, groupHasAgg) {
+  // Strip stale triggers first so toggles (e.g. group shrinks to 1, or
+  // aggregated reply just landed) take effect.
+  for (const btn of elQaBody.querySelectorAll(".agg-trigger")) btn.remove();
+  for (const [gid, arr] of groups.entries()) {
+    if (arr.length < 2) continue;          // single-Lab group: nothing to merge
+    if (groupHasAgg.get(gid)) continue;    // already aggregated
+    // Anchor the button on the highest-scoring item — that's the visual
+    // focal point of the group (matches the ★ position).
+    let anchor = arr[0];
+    for (const x of arr) if (x.score > anchor.score) anchor = x;
+    const btn = document.createElement("button");
+    btn.className = "agg-trigger";
+    btn.type = "button";
+    btn.textContent = "🧬 統合";
+    btn.title = "全 Lab の独立回答を中立 Aggregator で 1 つに統合";
+    btn.dataset.groupId = gid;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      runAggregate(gid, btn).catch((err) => {
+        console.warn("[aggregate] failed:", err.message);
+        setStatus(`aggregate failed: ${err.message}`);
+        btn.disabled = false;
+      });
+    });
+    anchor.el.querySelector(".meta")?.appendChild(btn);
+  }
+}
+
+// Collect a group's per-Lab answers, pick the lowest-accuracy Lab as the
+// neutral aggregator (low sigmoid(top_score) ⇒ small RAG / off-topic for
+// this Q ⇒ likely free capacity), and POST /api/chat with action=aggregate.
+async function runAggregate(groupId, btn) {
+  const items = Array.from(
+    elQaBody.querySelectorAll(`.qa-item[data-group-id="${CSS.escape(groupId)}"]`),
+  ).filter((el) => el.dataset.aggregated !== "1");
+  if (items.length < 2) return;
+  // Build {answer, lab_id, score:sigmoid(top_score)} per item, and route
+  // to the lowest-score Lab. Tie-break by shortest answer length (cheaper
+  // generation ⇒ free capacity heuristic).
+  const enriched = items.map((el) => {
+    const top = Number(el.dataset.topScore) || 0;
+    const opId = el.dataset.opId || "";
+    const labId = labState.labIdByOpId[opId] || "";
+    const answer = el.querySelector(".a")?.textContent || "";
+    const len = Number(el.dataset.answerLen) || answer.length;
+    return { el, opId, labId, score: sigmoid(top), answer, len };
+  });
+  enriched.sort((a, b) => (a.score - b.score) || (a.len - b.len));
+  const router = enriched[0];
+  if (!router?.opId) throw new Error("no routable Lab in group");
+  const question = items[0].querySelector(".q")?.textContent || "";
+  const parts = enriched.map((x) => ({
+    answer: x.answer,
+    lab_id: x.labId,
+    score: Number(x.score.toFixed(4)),
+  }));
+  btn.disabled = true;
+  setStatus(`aggregating via ${labState.labels[router.opId] || router.opId}…`);
+  await chat({
+    stage: "qa",
+    slide: currentSlidePayload(),
+    message: question,
+    operatorId: router.opId,
+    groupId,
+    action: "aggregate",
+    parts,
+  });
+  setStatus("aggregated ✓");
+  await refreshQaTimeline();
+}
+
+// Mirror the right-side QA panel into the maximized center-area board.
+// Source of truth is elQaBody (the side panel) — we read every qa-item +
+// dataset flag the timeline already sets (best/aggregated/topScore/opId)
+// and reformat each into a 3-row card: meta | Q | A. Skipped entirely
+// when the board isn't visible to avoid wasted DOM work on every refresh.
+function syncQaBoard() {
+  if (!elQaBoardBody) return;
+  if (!document.body.classList.contains("qa-maximized")) return;
+  const items = Array.from(elQaBody.querySelectorAll(".qa-item:not(.empty)"));
+  if (!items.length) {
+    elQaBoardBody.classList.add("qa-board-empty");
+    elQaBoardBody.replaceChildren(document.createTextNode("まだ質問はありません。"));
+    return;
+  }
+  elQaBoardBody.classList.remove("qa-board-empty");
+  const wasAtBottom =
+    elQaBoardBody.scrollHeight - elQaBoardBody.scrollTop - elQaBoardBody.clientHeight < 24;
+  const frag = document.createDocumentFragment();
+  for (const src of items) {
+    const card = document.createElement("div");
+    card.className = "qa-board-item";
+    if (src.dataset.aggregated === "1") card.classList.add("is-aggregated");
+    if (src.classList.contains("is-best")) card.classList.add("is-best");
+
+    const meta = document.createElement("div");
+    meta.className = "row-meta";
+    const lab = document.createElement("span");
+    lab.className = "lab";
+    lab.textContent = src.querySelector(".lab-badge")?.textContent || "Lab";
+    const ts = document.createElement("span");
+    ts.className = "ts";
+    const tsUnix = Number(src.dataset.ts) || 0;
+    ts.textContent = tsUnix
+      ? new Date(tsUnix * 1000).toLocaleTimeString()
+      : "—";
+    meta.append(lab, ts);
+    // Aggregated answers don't run RAG — top_score is always 0, so
+    // sigmoid would always read 0.50 and mislead the audience. Skip the
+    // σ chip entirely; the 🧬 icon below is the meaningful signal.
+    const isAgg = src.dataset.aggregated === "1";
+    if (!isAgg) {
+      const sig = document.createElement("span");
+      sig.className = "sig";
+      const top = Number(src.dataset.topScore) || 0;
+      const sigVal = sigmoid(top);
+      sig.textContent = `σ ${sigVal.toFixed(2)}`;
+      if (sigVal < WEAK_SCORE_SIGMOID) sig.classList.add("weak");
+      sig.title = `sigmoid(top_score) = ${sigVal.toFixed(3)}`;
+      meta.append(sig);
+    }
+
+    const icons = document.createElement("span");
+    icons.className = "icons";
+    if (src.querySelector(".best-badge")) {
+      const i = document.createElement("span");
+      i.className = "icon best"; i.textContent = "★"; i.title = "best";
+      icons.appendChild(i);
+    }
+    if (src.querySelector(".like-badge")) {
+      const i = document.createElement("span");
+      i.className = "icon like"; i.textContent = "👍"; i.title = "高信頼";
+      icons.appendChild(i);
+    }
+    if (src.dataset.aggregated === "1") {
+      const i = document.createElement("span");
+      i.className = "icon agg"; i.textContent = "🧬"; i.title = "統合";
+      icons.appendChild(i);
+    }
+    if (icons.childElementCount) meta.appendChild(icons);
+
+    const q = document.createElement("div");
+    q.className = "row-q";
+    q.textContent = src.querySelector(".q")?.textContent || "";
+    const a = document.createElement("div");
+    a.className = "row-a";
+    a.textContent = src.querySelector(".a")?.textContent || "";
+
+    card.append(meta, q, a);
+    frag.appendChild(card);
+  }
+  elQaBoardBody.replaceChildren(frag);
+  if (wasAtBottom) elQaBoardBody.scrollTop = elQaBoardBody.scrollHeight;
+}
+
+if (elQaMaximize) {
+  elQaMaximize.addEventListener("click", () => {
+    const next = !document.body.classList.contains("qa-maximized");
+    document.body.classList.toggle("qa-maximized", next);
+    elQaMaximize.setAttribute("aria-pressed", String(next));
+    elQaMaximize.textContent = next ? "🗗" : "⛶";
+    elQaMaximize.title = next ? "通常表示に戻す" : "質疑応答を中央エリアに最大化";
+    if (next) syncQaBoard();
+  });
 }
 
 function _formatTimestamp(unix) {
@@ -1773,6 +1981,17 @@ async function fanOutQa(question, labs) {
   // item per group — so ★ best is derivable from server state alone and
   // survives reload.
   await refreshQaTimeline();
+
+  // Auto-aggregate when every fanned-out Lab returned successfully. We
+  // chase the 🧬 trigger that placeAggregateTriggers attached during the
+  // refresh and click it. Partial-success groups skip auto-aggregation
+  // (manual button still available) so the merged answer always reflects
+  // every selected Lab.
+  if (failed === 0 && ok >= 2) {
+    const btn = elQaBody.querySelector(
+      `.agg-trigger[data-group-id="${CSS.escape(groupId)}"]`);
+    if (btn && !btn.disabled) btn.click();
+  }
 }
 
 btnAsk.addEventListener("click", async () => {

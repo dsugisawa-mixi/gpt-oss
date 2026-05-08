@@ -46,7 +46,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
 
 from openai_harmony import (
@@ -386,6 +386,13 @@ class ChatRequest(BaseModel):
     # timeline echoes it back so the GUI can re-derive ★ best across the
     # group on reload (the badge is otherwise lost with the page).
     group_id: str = ""
+    # Discriminator. "" = normal chat (RAG + persona). "aggregate" = neutral
+    # synthesis: skip RAG/persona/slide context and merge `parts` (each Lab's
+    # independent answer + sigmoid-confidence) into one weighted reply.
+    action: str = ""
+    # Synthesis inputs for action=aggregate. Each entry: {answer, lab_id, score}
+    # where score is the 0-1 sigmoid-of-top_score from the contributing Lab.
+    parts: list[dict] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):
@@ -1133,6 +1140,61 @@ def retrieve_knowledge(query: str, *, top_k: int = 5) -> list[dict]:
         return []
 
 
+def _build_aggregate_messages(question: str, parts: list[dict]) -> list[dict[str, str]]:
+    """Synthesis-only prompt for action=aggregate. No RAG, no presenter
+    persona, no slide context — the routed Lab acts as a neutral aggregator
+    that merges other Labs' independent answers into one, weighting by each
+    contributor's sigmoid-confidence so weak-grounded answers stay as
+    references rather than load-bearing claims.
+
+    System is English (procedural meta-instructions instruct-follow more
+    reliably on gpt-oss). User turn carries the Japanese question + answers
+    so the output language stays aligned with the rest of the timeline; a
+    final `Reply in Japanese.` line guards against drift to English."""
+    system_content = (
+        "You are a neutral aggregator. Multiple specialized RAG-backed Labs "
+        "have produced independent answers to the same question. Each answer "
+        "carries an accuracy value in [0,1] (sigmoid of the source Lab's RAG "
+        "reranker top-score). Treat accuracy as a weight: claims from "
+        "high-accuracy answers may anchor the reply; claims from low-accuracy "
+        "answers must be demoted to references and never load-bearing.\n"
+        "Rules:\n"
+        "- Do NOT retrieve from your own corpus. Use ONLY the materials below.\n"
+        "- If two answers conflict, surface both with their accuracies and "
+        "prefer the higher-accuracy claim, but flag the disagreement.\n"
+        "- If ALL accuracies are weak (e.g. <= 0.6), say so plainly: "
+        "「いずれの根拠も弱い」 and avoid committing to specifics.\n"
+        "- Produce one merged reply, not a list of per-Lab summaries.\n"
+        "- Keep it concise (3–6 sentences) and natural for TTS playback.\n"
+        "- Reply in Japanese."
+    )
+
+    lines: list[str] = []
+    lines.append("【質問】")
+    lines.append((question or "").strip() or "(質問テキストなし)")
+    lines.append("")
+    if not parts:
+        lines.append("【独立回答】(なし — 統合対象が空。質問のみに簡潔に応答してください)")
+    else:
+        lines.append("【各 Lab の独立回答 と accuracy】")
+        for i, p in enumerate(parts, 1):
+            lab = (p.get("lab_id") or "?").strip() or "?"
+            try:
+                score = float(p.get("score", 0.0))
+            except (TypeError, ValueError):
+                score = 0.0
+            ans = (p.get("answer") or "").strip() or "(空回答)"
+            lines.append(f"--- 回答 {i} / Lab={lab} / accuracy={score:.2f} ---")
+            lines.append(ans)
+        lines.append("")
+    lines.append("以上の素材を accuracy で重み付けしつつ、1 つの回答に統合してください。")
+
+    return [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
 def _build_rag_query(stage: str, message: str, slide: Optional[SlideContent]) -> str:
     parts: list[str] = []
     if slide:
@@ -1388,6 +1450,56 @@ async def chat(req: ChatRequest):
         return JSONResponse(
             status_code=400,
             content={"detail": f"invalid stage: {req.stage!r}. expected one of {VALID_STAGES}"},
+        )
+
+    # Neutral aggregator path. Skips RAG/persona/slide context entirely;
+    # synthesizes the supplied per-Lab answers (with their sigmoid accuracies
+    # as weights) into a single merged reply. Routed here from the GUI to
+    # whichever Lab has the lowest accuracy in the group — the assumption is
+    # that a low score means "small RAG / off-topic for this question", so
+    # that Lab is most likely to have spare capacity right now.
+    if req.action == "aggregate":
+        prompt_messages = _build_aggregate_messages(req.message or "", req.parts or [])
+        reply, truncated = generate_reply(prompt_messages)
+        reply = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "", reply)
+        reply = re.sub(r"\s+", " ", reply).strip()
+        storable_reply = reply
+        if truncated and reply:
+            terminators = "。！？.!?"
+            last_end = max((reply.rfind(c) for c in terminators), default=-1)
+            if last_end >= 0:
+                storable_reply = reply[: last_end + 1]
+                reply = storable_reply
+            else:
+                storable_reply = ""
+        # `aggregated: True` marks this entry so the GUI can render the
+        # 🧬 statement and skip it from the ★ best competition (synthesis is
+        # not a candidate, it's the merger).
+        accuracy = {
+            "rag_hits": 0,
+            "top_score": 0.0,
+            "mean_score": 0.0,
+            "aggregated": True,
+        }
+        if (req.message or "").strip() and storable_reply:
+            _record_qa(
+                user_id=req.user_id,
+                question=req.message.strip(),
+                answer=storable_reply,
+                slide_page=req.slide.page if req.slide else None,
+                lab_id=LAB_ID,
+                accuracy=accuracy,
+                group_id=(req.group_id or "").strip(),
+            )
+        _touch_presence(req.user_id)
+        return ChatResponse(
+            user_id=req.user_id,
+            reply=reply,
+            stage=req.stage,
+            slide_page=req.slide.page if req.slide else None,
+            voice=(req.voice or "male"),
+            lab_id=LAB_ID,
+            accuracy=accuracy,
         )
 
     # Only `presenting` is stateful — earlier slides should inform later ones

@@ -331,6 +331,27 @@
     padding: 1px 6px; border-radius: 10px;
   }
   .qa-item.is-best { border-color: #5a4520; box-shadow: 0 0 0 1px rgba(255, 210, 102, 0.3); }
+  /* 中立 Aggregator が出した統合回答。★/👍 の競合からは除外され、
+     代わりに 🧬 バッジで「これは合成された 1 件」であることを示す。 */
+  .qa-item[data-aggregated="1"] {
+    border-color: #4a3a6a;
+    box-shadow: 0 0 0 1px rgba(180, 140, 240, 0.25);
+  }
+  .qa-item .meta .agg-badge {
+    color: #d8c8ff; font-size: 0.85em; font-weight: 700;
+    background: #1a1430; border: 1px solid #3a2a5a;
+    padding: 1px 6px; border-radius: 10px;
+  }
+  /* fan-out 完了後に表示される統合トリガ。各 group の最高スコア item に 1 つだけ
+     付き、統合回答が到着すると recomputeBestBadges が消す。 */
+  .qa-item .meta .agg-trigger {
+    background: #1a1430; color: #d8c8ff;
+    border: 1px solid #3a2a5a; border-radius: 10px;
+    font-size: 0.85em; font-weight: 600;
+    padding: 1px 8px; cursor: pointer;
+  }
+  .qa-item .meta .agg-trigger:hover { border-color: #6a4ab0; color: #fff; }
+  .qa-item .meta .agg-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
   .qa-item .meta .qa-speak {
     background: none; border: 1px solid #2a3a5a; color: #cfd5e6;
     border-radius: 50%;
@@ -436,6 +457,84 @@
     color: #f5f5fa;
   }
   #script-pane .empty { color: #5a6280; font-style: italic; }
+
+  /* Maximized Q&A board: takes over the slide column when the user toggles
+     the ⛶ button on the right Q&A panel. The slide content (page-num, h2,
+     ul, iframe, loader, script-pane) is hidden so the board can use the
+     full center area. The right Q&A panel is unaffected. */
+  #qa-board { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+  body.qa-maximized #slide .page-num,
+  body.qa-maximized #slide h2,
+  body.qa-maximized #slide ul,
+  body.qa-maximized #slide #slide-frame,
+  body.qa-maximized #slide #script-pane,
+  body.qa-maximized #slide #slide-loader { display: none !important; }
+  body.qa-maximized #slide #qa-board { display: flex; }
+  body.qa-maximized #slide { padding: 14px 18px; }
+  #qa-board #qa-board-body {
+    overflow-y: auto;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex; flex-direction: column; gap: 12px;
+    padding-right: 4px;
+  }
+  #qa-board #qa-board-body.qa-board-empty {
+    color: #5a6280; text-align: center; padding: 40px 0;
+    align-items: center; justify-content: center;
+  }
+  #qa-maximize { font-size: 1em; }
+  #qa-maximize[aria-pressed="true"] { color: #e94560; }
+  /* Each board item: 3 logical rows — meta header (Lab / time / sigmoid +
+     icons), Q text, A text — laid out as a stacked card so the table reads
+     top-to-bottom in the wider center column. */
+  .qa-board-item {
+    background: #11192e;
+    border: 1px solid #1a2245;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .qa-board-item .row-meta {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 8px 14px;
+    background: rgba(0,0,0,0.25);
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 0.92em;
+  }
+  .qa-board-item .row-meta .lab {
+    color: #f0a8b6; font-weight: 700;
+    background: rgba(233, 69, 96, 0.15);
+    border: 1px solid rgba(233, 69, 96, 0.4);
+    padding: 2px 8px; border-radius: 10px;
+  }
+  .qa-board-item .row-meta .ts { color: #98a0c0; font-variant-numeric: tabular-nums; }
+  .qa-board-item .row-meta .sig {
+    color: #cfd5e6; font-family: 'SFMono-Regular', Consolas, monospace;
+    background: #0b1124; border: 1px solid #1a2245;
+    padding: 1px 8px; border-radius: 10px;
+  }
+  .qa-board-item .row-meta .sig.weak { color: #1a1408; background: #f3c34a; border-color: #b48a1a; font-weight: 700; }
+  .qa-board-item .row-meta .icons { margin-left: auto; display: flex; gap: 6px; }
+  .qa-board-item .row-meta .icon {
+    font-size: 0.92em; padding: 1px 6px; border-radius: 10px;
+    border: 1px solid #2a3a5a;
+  }
+  .qa-board-item .row-meta .icon.best   { color: #ffd266; background: #2a1f08; border-color: #5a4520; }
+  .qa-board-item .row-meta .icon.like   { color: #5ad08b; background: #0e2418; border-color: #1f4a30; }
+  .qa-board-item .row-meta .icon.agg    { color: #d8c8ff; background: #1a1430; border-color: #3a2a5a; }
+  .qa-board-item .row-q {
+    padding: 10px 14px;
+    color: #f0a8b6; font-size: 1.05em; line-height: 1.55;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .qa-board-item .row-q:before { content: "Q "; color: #e94560; font-weight: 700; }
+  .qa-board-item .row-a {
+    padding: 12px 14px 14px;
+    color: #d5d8e8; font-size: 1em; line-height: 1.65;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .qa-board-item .row-a:before { content: "A "; color: #5ad08b; font-weight: 700; }
+  .qa-board-item.is-aggregated { border-color: #4a3a6a; box-shadow: 0 0 0 1px rgba(180, 140, 240, 0.25); }
+  .qa-board-item.is-best { border-color: #5a4520; box-shadow: 0 0 0 1px rgba(255, 210, 102, 0.3); }
 
   /* Upload progress modal — floats over the layout while generation runs. */
   #upload-overlay {
@@ -664,6 +763,9 @@
       <div id="slide-loader-msg">ただいま処理中です…<br><span style="color:#98a0c0;font-size:0.85em">論文からスライドを生成しています（数分かかります）</span></div>
     </div>
     <iframe id="slide-frame" title="generated slides"></iframe>
+    <div id="qa-board" aria-hidden="true">
+      <div id="qa-board-body" class="qa-board-empty">まだ質問はありません。</div>
+    </div>
     <div id="script-pane">
       <div class="meta"><span class="idx" id="script-idx">—</span><span id="script-title"></span><span style="margin-left:auto;color:#5a6280" id="script-progress"></span></div>
       <div id="script-lines"><div class="empty">スピーカーノートはまだありません。</div></div>
@@ -690,7 +792,11 @@
       </div>
     </div>
     <div class="panel" id="qa-list">
-      <h3><span class="title">質疑応答</span> <span class="count" id="qa-count">0</span></h3>
+      <h3>
+        <span class="title">質疑応答</span>
+        <span class="count" id="qa-count">0</span>
+        <button class="ham" id="qa-maximize" type="button" aria-label="最大化" aria-pressed="false" title="質疑応答を中央エリアに最大化">⛶</button>
+      </h3>
       <div class="body" id="qa-body">
         <div class="qa-item empty">まだ質問はありません。</div>
       </div>
