@@ -225,6 +225,32 @@ def get_index_meta() -> Optional[dict]:
         return dict(_index_meta) if _index_meta else None
 
 
+def embed_texts(texts: list[str]):
+    """Encode a batch of strings with the same embedder used for queries,
+    returning an L2-normalized numpy array of shape (n, dim) or None if
+    the embedder is unavailable.
+
+    FACR's novelty term needs to compare new evidence against the prior
+    evidence pool by cosine similarity, and reusing the live SentenceTransformer
+    avoids loading a second model just for this. Empty list returns None too
+    (callers fall back to a token-overlap heuristic in that case).
+    """
+    if not texts:
+        return None
+    if not _load_index():
+        return None
+    embedder, _index, _meta = _snapshot()
+    if embedder is None:
+        return None
+    try:
+        return embedder.encode(
+            texts, normalize_embeddings=True, convert_to_numpy=True
+        )
+    except Exception:
+        logger.exception("paper_rag.embed_texts failed")
+        return None
+
+
 def _filter_to_sql(filter: dict) -> str:
     """Convert a flat {key: value} dict into a LanceDB WHERE clause.
 

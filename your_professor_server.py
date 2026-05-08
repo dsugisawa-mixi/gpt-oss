@@ -324,6 +324,44 @@ async def gate_until_rag_ready(request: Request, call_next):
     return await call_next(request)
 
 
+# Endpoints that contend with build_paper_index.py for GPU/CPU. While the
+# index rebuild runs, embedder forward passes saturate VRAM and PDF text
+# extraction pegs every core — concurrent traffic on these paths either
+# OOMs or queues for minutes. Reads (timeline, presence, summary, etc.)
+# stay open so the GUI can keep polling and display the rebuild banner.
+_REBUILD_BLOCKED_PREFIXES = (
+    "/api/chat",
+    "/api/upload/start",
+    "/api/upload/text/start",
+    "/api/tts/",
+)
+
+
+@app.middleware("http")
+async def gate_during_rebuild(request: Request, call_next):
+    """Return 423 Locked for GPU-using endpoints while a RAG rebuild is
+    in progress. The frontend recognizes 423 and surfaces the message to
+    the user instead of treating it as a generic failure."""
+    if (
+        _rag_rebuilding
+        and request.method != "OPTIONS"
+        and any(request.url.path.startswith(p) for p in _REBUILD_BLOCKED_PREFIXES)
+    ):
+        logger.info(
+            "gate: 423 (rag rebuilding) %s %s",
+            request.method, request.url.path,
+        )
+        return JSONResponse(
+            status_code=423,
+            content={
+                "detail": "RAGリビルド中です。完了後に再度お試しください。",
+                "rebuilding": True,
+            },
+            headers={"Retry-After": "30"},
+        )
+    return await call_next(request)
+
+
 # Global state
 generator = None   # vLLM TokenGenerator
 encoding = None    # Harmony encoding
@@ -389,10 +427,19 @@ class ChatRequest(BaseModel):
     # Discriminator. "" = normal chat (RAG + persona). "aggregate" = neutral
     # synthesis: skip RAG/persona/slide context and merge `parts` (each Lab's
     # independent answer + sigmoid-confidence) into one weighted reply.
+    # "cross_examine" = FACR rebuttal pass: re-search this Lab's corpus
+    # against a peer Lab's claim, score relevance·novelty·support, return Δ.
     action: str = ""
     # Synthesis inputs for action=aggregate. Each entry: {answer, lab_id, score}
     # where score is the 0-1 sigmoid-of-top_score from the contributing Lab.
     parts: list[dict] = Field(default_factory=list)
+    # FACR cross-examination inputs (action=cross_examine). The peer Lab's
+    # atomic claim under test, the evidence pool collected so far across all
+    # rounds (used for the novelty term — chunks that duplicate prior evidence
+    # contribute Δ≈0), and the round index for telemetry.
+    claim: str = ""
+    prior_evidence: list[str] = Field(default_factory=list)
+    round_idx: int = 0
 
 
 class ChatResponse(BaseModel):
@@ -947,6 +994,14 @@ _rag_rebuild_queue: "asyncio.Queue[str]" = None  # initialized at startup
 # should drop out of the registry rather than serve degraded.
 _rag_ready: bool = False
 
+# True only while build_paper_index.py + reload_index are actively running.
+# build_paper_index.py burns the GPU (embedder forward pass over the entire
+# corpus) and pegs CPU on PDF→text extraction, so concurrent /api/chat or
+# slide-generation jobs slow to a crawl AND can OOM the GPU. Surfaces in
+# /api/lab/summary so the GUI can display the badge, and is read by the
+# gate_during_rebuild middleware to 423 the GPU-using endpoints.
+_rag_rebuilding: bool = False
+
 
 @app.on_event("startup")
 async def _log_corpus_paths():
@@ -1087,16 +1142,18 @@ async def _rag_rebuild_worker() -> None:
     gate middleware lets /api/* through — regardless of build success,
     since failure leaves the previous on-disk index in place and we
     prefer "serve with stale index" over "block forever"."""
-    global _rag_ready
+    global _rag_ready, _rag_rebuilding
     logger.info("rag rebuild worker: started")
     while True:
         trigger = await _rag_rebuild_queue.get()
+        _rag_rebuilding = True
         try:
             ok = await _do_rag_rebuild_once(trigger)
         except Exception:
             logger.exception("rag rebuild worker: pass for %s raised", trigger)
             ok = False
         finally:
+            _rag_rebuilding = False
             _rag_rebuild_queue.task_done()
         if trigger == "startup" and not _rag_ready:
             _rag_ready = True
@@ -1193,6 +1250,222 @@ def _build_aggregate_messages(question: str, parts: list[dict]) -> list[dict[str
         {"role": "system", "content": system_content},
         {"role": "user", "content": "\n".join(lines)},
     ]
+
+
+def _build_cross_exam_messages(
+    question: str, claim: str, evidence_blocks: list[str]
+) -> list[dict[str, str]]:
+    """One-shot stance classifier for FACR cross-examination.
+
+    Given the original question, the peer Lab's atomic claim, and the new
+    evidence chunks this Lab just retrieved from its OWN corpus, ask the LLM
+    to label each chunk's stance toward the claim. Output is forced to a
+    compact JSON array so we can parse it deterministically; the LLM is
+    instructed not to free-form. We deliberately keep the rubric tight:
+    SUPPORT must be a positive entailment of the claim (not just same topic),
+    REBUT requires a direct contradiction, otherwise NEUTRAL. This is the
+    "support" factor in Δ = relevance · novelty · support — picking the
+    wrong stance is what costs the contributing Lab credit.
+    """
+    rubric = (
+        "You are an NLI-style classifier for a federated RAG system.\n"
+        "For each candidate evidence chunk, label its stance toward the CLAIM:\n"
+        "  SUPPORT  — the chunk entails or directly corroborates the claim\n"
+        "  REBUT    — the chunk contradicts or directly refutes the claim\n"
+        "  NEUTRAL  — same topic but does not entail or refute (default)\n"
+        "Be strict. Topical overlap alone is NEUTRAL. If unsure, say NEUTRAL.\n"
+        "Output ONLY a JSON array, one object per chunk in input order:\n"
+        "[{\"i\": 0, \"stance\": \"SUPPORT|REBUT|NEUTRAL\"}, ...]\n"
+        "No prose, no markdown fences."
+    )
+    lines: list[str] = []
+    lines.append(f"QUESTION: {(question or '').strip() or '(none)'}")
+    lines.append(f"CLAIM: {(claim or '').strip() or '(none)'}")
+    lines.append("")
+    lines.append("CHUNKS:")
+    for i, ev in enumerate(evidence_blocks):
+        snippet = (ev or "").strip().replace("\n", " ")
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "…"
+        lines.append(f"[{i}] {snippet}")
+    return [
+        {"role": "system", "content": rubric},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+def _parse_stance_json(text: str, n: int) -> list[str]:
+    """Parse the LLM's stance verdict array. Defensive: any malformed entry
+    falls back to NEUTRAL so the Δ contribution becomes zero rather than
+    crashing the round."""
+    out = ["NEUTRAL"] * n
+    if not text:
+        return out
+    try:
+        m = re.search(r"\[.*\]", text, flags=re.DOTALL)
+        if not m:
+            return out
+        arr = json.loads(m.group(0))
+        if not isinstance(arr, list):
+            return out
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("i", -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < n:
+                stance = str(item.get("stance", "")).strip().upper()
+                if stance in ("SUPPORT", "REBUT", "NEUTRAL"):
+                    out[idx] = stance
+    except Exception:
+        logger.exception("FACR: stance JSON parse failed; defaulting all to NEUTRAL")
+    return out
+
+
+def _novelty_scores(new_texts: list[str], prior_texts: list[str]) -> list[float]:
+    """1 − max cosine similarity of each new chunk against the prior pool.
+
+    Uses paper_rag.embed_texts so we share the live SentenceTransformer with
+    /api/chat's normal RAG path. If the embedder is unavailable we fall back
+    to a cheap char-trigram Jaccard so FACR still degrades gracefully (a
+    missing embedder shouldn't silently zero out novelty for everyone).
+    """
+    if not new_texts:
+        return []
+    if not prior_texts:
+        return [1.0] * len(new_texts)
+
+    if _paper_rag is not None:
+        try:
+            new_vec = _paper_rag.embed_texts(new_texts)
+            prior_vec = _paper_rag.embed_texts(prior_texts)
+            if new_vec is not None and prior_vec is not None and len(prior_vec):
+                sims = new_vec @ prior_vec.T  # both L2-normalized
+                max_sim = sims.max(axis=1)
+                return [float(max(0.0, min(1.0, 1.0 - s))) for s in max_sim]
+        except Exception:
+            logger.exception("FACR: vector novelty failed; falling back to trigram")
+
+    def _trigrams(s: str) -> set:
+        s = (s or "").lower()
+        return {s[i : i + 3] for i in range(max(0, len(s) - 2))}
+
+    prior_grams = [_trigrams(p) for p in prior_texts]
+    out: list[float] = []
+    for t in new_texts:
+        tg = _trigrams(t)
+        if not tg:
+            out.append(0.0)
+            continue
+        best = 0.0
+        for pg in prior_grams:
+            inter = len(tg & pg)
+            if not inter:
+                continue
+            j = inter / float(len(tg | pg))
+            if j > best:
+                best = j
+        out.append(float(max(0.0, min(1.0, 1.0 - best))))
+    return out
+
+
+def _sigmoid(x: float) -> float:
+    if x >= 0:
+        z = 2.718281828 ** (-x)
+        return 1.0 / (1.0 + z)
+    z = 2.718281828 ** x
+    return z / (1.0 + z)
+
+
+def _facr_cross_examine(
+    question: str, claim: str, prior_evidence: list[str], top_k: int = 4
+) -> dict:
+    """Run one round of FACR cross-examination on this Lab's corpus.
+
+    Pipeline:
+      1. retrieve_knowledge(claim, top_k) — re-search OUR corpus for the
+         peer's claim (intentionally querying with the claim, not the
+         original question, so we hit the part of our corpus that talks
+         about the same proposition the peer is asserting).
+      2. relevance = sigmoid(reranker raw logit). Already 0..1.
+      3. novelty   = 1 − max cos(chunk, prior). Chunks redundant with
+         existing evidence contribute zero.
+      4. support   = +1 / 0 / −1 from the LLM stance classifier.
+      5. Δ         = Σ_e relevance(e) · novelty(e) · support(e)
+
+    Returns a dict the orchestrator persists per (Lab, round). The LLM
+    classifier is the only synchronous LLM call; vectorization + retrieval
+    are cheap enough that the whole call fits in one /api/chat budget.
+    """
+    if not _rag_search:
+        return {
+            "delta": 0.0,
+            "evidence": [],
+            "components": {"relevance": [], "novelty": [], "support": []},
+            "stances": [],
+            "note": "rag_unavailable",
+        }
+    hits = retrieve_knowledge(claim, top_k=top_k)
+    if not hits:
+        return {
+            "delta": 0.0,
+            "evidence": [],
+            "components": {"relevance": [], "novelty": [], "support": []},
+            "stances": [],
+            "note": "no_hits",
+        }
+
+    new_texts = [(h.get("text") or "").strip() for h in hits]
+    relevance = [_sigmoid(float(h.get("score", 0.0))) for h in hits]
+    novelty = _novelty_scores(new_texts, prior_evidence)
+
+    try:
+        msgs = _build_cross_exam_messages(question, claim, new_texts)
+        # gpt-oss spends most of its budget in the analysis channel before
+        # emitting the final JSON; observed round-1 was out=256, final=0
+        # — i.e. reasoning ate the whole 256-token budget and the stance
+        # array never got written. 1024 leaves comfortable headroom for
+        # ~750 reasoning tokens + the short JSON array we actually need.
+        verdict, _trunc = generate_reply(msgs, max_new_tokens=1024, max_reply_tokens=200)
+        stances = _parse_stance_json(verdict, len(new_texts))
+    except Exception:
+        logger.exception("FACR: stance LLM call failed; defaulting to NEUTRAL")
+        stances = ["NEUTRAL"] * len(new_texts)
+
+    stance_val = {"SUPPORT": 1.0, "REBUT": -1.0, "NEUTRAL": 0.0}
+    contribs: list[float] = []
+    delta = 0.0
+    for r, n, s in zip(relevance, novelty, stances):
+        c = float(r) * float(n) * stance_val.get(s, 0.0)
+        contribs.append(c)
+        delta += c
+
+    evidence_out: list[dict] = []
+    for h, r, n, s, c in zip(hits, relevance, novelty, stances, contribs):
+        evidence_out.append({
+            "title": h.get("title", ""),
+            "source": h.get("source", ""),
+            "text": (h.get("text") or "")[:400],
+            "score": float(h.get("score", 0.0)),
+            "relevance": round(float(r), 4),
+            "novelty": round(float(n), 4),
+            "stance": s,
+            "delta": round(float(c), 4),
+        })
+
+    return {
+        "delta": round(float(delta), 4),
+        "evidence": evidence_out,
+        "components": {
+            "relevance": [round(float(x), 4) for x in relevance],
+            "novelty": [round(float(x), 4) for x in novelty],
+            "support": [stance_val.get(s, 0.0) for s in stances],
+        },
+        "stances": stances,
+        "note": "ok",
+    }
 
 
 def _build_rag_query(stage: str, message: str, slide: Optional[SlideContent]) -> str:
@@ -1363,7 +1636,7 @@ def _to_harmony_messages(prompt_messages: list[dict]) -> list[Message]:
 
 def generate_reply(
     prompt_messages: list[dict],
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 1024,
     max_reply_tokens: int = 220,
 ) -> tuple[str, bool]:
     """Run one forward pass and return (final_reply_text, truncated)."""
@@ -1395,12 +1668,34 @@ def generate_reply(
     gen_count = 0
     final_token_count = 0
     truncated = False
+    runaway = False
+
+    # Steady-state on this GPU is ~50-65 tok/s; anything above 2000 tok/s
+    # means vLLM is yielding without doing real forward passes. Observed in
+    # production after heavy prefix-cache reuse — engine reports
+    # "Avg generation throughput: 0.0 tokens/s" yet the loop receives tokens
+    # in microseconds, parser ends up appending the same delta hundreds of
+    # times, and the user gets a degenerate looping reply. Check after a
+    # short warm-up so we don't false-positive on legitimate short replies.
+    RUNAWAY_TOK_PER_SEC = 2000.0
+    RUNAWAY_WARMUP_TOKENS = 32
 
     for predicted_token in generator.generate(
         tokens, stop_tokens=stop_tokens, temperature=0.7, max_tokens=max_new_tokens
     ):
         parser.process(predicted_token)
         gen_count += 1
+        if gen_count == RUNAWAY_WARMUP_TOKENS:
+            elapsed_s = time.perf_counter() - t1
+            if elapsed_s > 0 and gen_count / elapsed_s > RUNAWAY_TOK_PER_SEC:
+                runaway = True
+                logger.error(
+                    "generate: runaway detected (%d tok in %.1fms, %.0f tok/s) "
+                    "— vLLM KV/prefix cache state appears corrupted; aborting "
+                    "this reply (recommend `docker compose restart gpt-oss-llm`)",
+                    gen_count, elapsed_s * 1000, gen_count / elapsed_s,
+                )
+                break
         ch = parser.current_channel
         if ch:
             channels_seen.add(ch)
@@ -1419,11 +1714,37 @@ def generate_reply(
     tok_per_sec = gen_count / (t2 - t1) if (t2 - t1) > 0 else 0
 
     reply = "".join(final_parts)
+    if runaway:
+        # Replace the corrupted partial reply with a user-visible error.
+        # Tag truncated=True so the GUI doesn't try to TTS-speak it.
+        reply = (
+            "(生成エンジンの異常状態を検知したため、この回答は破棄されました。"
+            "サーバの再起動が必要な可能性があります。)"
+        )
+        truncated = True
+    elif final_token_count == 0:
+        # Model burned the full max_new_tokens budget reasoning but never
+        # transitioned to the final channel — typical when the question is
+        # off-topic for the slide/RAG context, so the model can't decide
+        # what to commit to. Returning "" silently breaks the QA timeline
+        # (and any TTS that would speak it). Replace with an honest stand-in
+        # so the user sees a deliberate non-answer instead of dead air.
+        logger.warning(
+            "generate: empty final channel after %d tok — returning fallback "
+            "reply (likely off-topic question for this corpus)",
+            gen_count,
+        )
+        reply = (
+            "(申し訳ありません。今のスライドや論文の内容からは、その質問に直接お答えできる材料がありませんでした。"
+            "別の角度の質問をお試しください。)"
+        )
+        truncated = True
     logger.info(
         "generate: reply_len=%d truncated=%s in=%d out=%d (final=%d) "
-        "encode=%.1fms gen=%.1fms (%.1f tok/s) channels=%s",
+        "encode=%.1fms gen=%.1fms (%.1f tok/s) channels=%s%s",
         len(reply), truncated, len(tokens), gen_count, final_token_count,
         (t1 - t0) * 1000, gen_ms, tok_per_sec, channels_seen,
+        " RUNAWAY" if runaway else "",
     )
     return reply, truncated
 
@@ -1450,6 +1771,56 @@ async def chat(req: ChatRequest):
         return JSONResponse(
             status_code=400,
             content={"detail": f"invalid stage: {req.stage!r}. expected one of {VALID_STAGES}"},
+        )
+
+    # FACR cross-examination path. The orchestrator (browser) sends one
+    # peer Lab's atomic claim + the running prior-evidence pool; we rebut
+    # against OUR corpus, classify stance per chunk, and return Δ. No QA
+    # timeline write — this is an inner-loop machine signal, not a public
+    # answer. The reply field carries a short human-readable summary so the
+    # frontend can show "supported / rebutted / neutral" without re-parsing.
+    if req.action == "cross_examine":
+        result = _facr_cross_examine(
+            question=(req.message or "").strip(),
+            claim=(req.claim or "").strip(),
+            prior_evidence=list(req.prior_evidence or []),
+            top_k=4,
+        )
+        delta = float(result.get("delta", 0.0))
+        stances = result.get("stances") or []
+        n_sup = sum(1 for s in stances if s == "SUPPORT")
+        n_reb = sum(1 for s in stances if s == "REBUT")
+        n_neu = sum(1 for s in stances if s == "NEUTRAL")
+        if delta > 0:
+            verdict = f"corroborated (Δ={delta:+.3f})"
+        elif delta < 0:
+            verdict = f"rebutted (Δ={delta:+.3f})"
+        else:
+            verdict = f"abstain (Δ={delta:+.3f})"
+        summary = (
+            f"FACR round={req.round_idx} {verdict} "
+            f"[support={n_sup} rebut={n_reb} neutral={n_neu}] "
+            f"on claim: {(req.claim or '').strip()[:80]}"
+        )
+        accuracy = {
+            "rag_hits": len(result.get("evidence") or []),
+            "top_score": 0.0,
+            "mean_score": 0.0,
+            "facr": True,
+            "delta": delta,
+            "round_idx": req.round_idx,
+            "stances": stances,
+            "evidence": result.get("evidence") or [],
+        }
+        _touch_presence(req.user_id)
+        return ChatResponse(
+            user_id=req.user_id,
+            reply=summary,
+            stage=req.stage,
+            slide_page=req.slide.page if req.slide else None,
+            voice=(req.voice or "male"),
+            lab_id=LAB_ID,
+            accuracy=accuracy,
         )
 
     # Neutral aggregator path. Skips RAG/persona/slide context entirely;
@@ -1688,6 +2059,9 @@ def _build_lab_summary_payload() -> dict:
             "embed_dim": (meta or {}).get("dim"),
         },
         "current_meta": dict(current_meta),
+        # GUI gates question/upload/tech-memo while True and shows a
+        # "🔄 RAGリビルド中…" badge on the corresponding lab card.
+        "rebuilding": _rag_rebuilding,
     }
 
 

@@ -247,7 +247,18 @@ function activeLabForStage(_stage) {
   return singleSelectedLab();
 }
 
-async function chat({ stage, slide = null, message = "", operatorId = null, groupId = "", action = "", parts = null }) {
+async function chat({
+  stage,
+  slide = null,
+  message = "",
+  operatorId = null,
+  groupId = "",
+  action = "",
+  parts = null,
+  claim = "",
+  priorEvidence = null,
+  roundIdx = 0,
+}) {
   const opId = operatorId ?? activeLabForStage(stage);
   // /api/chat reads user_id from the body (not the header), so we must
   // send the uid that belongs to whichever Lab opId routes to.
@@ -268,6 +279,13 @@ async function chat({ stage, slide = null, message = "", operatorId = null, grou
   // small RAG / off-topic for this Q ⇒ likely free capacity).
   if (action) body.action = action;
   if (parts && parts.length) body.parts = parts;
+  // FACR cross-examination payload (action=cross_examine). The peer Lab's
+  // atomic claim, the running evidence pool collected so far across rounds
+  // (used as the novelty baseline server-side), and the round index for
+  // telemetry. Server replies with accuracy.delta + accuracy.evidence.
+  if (claim) body.claim = claim;
+  if (priorEvidence && priorEvidence.length) body.prior_evidence = priorEvidence;
+  if (roundIdx) body.round_idx = roundIdx;
   const r = await fetch(withLab("/api/chat", opId), {
     method: "POST",
     headers: getAuthHeaders(USER_IDS),
@@ -275,9 +293,27 @@ async function chat({ stage, slide = null, message = "", operatorId = null, grou
   });
   if (!r.ok) {
     const err = await r.text();
+    if (r.status === 423) {
+      // Server is mid-RAG-rebuild. Tag the error so callers can distinguish
+      // it from a true backend failure and route to a notify() banner.
+      const e = new Error(_extractRebuildMessage(err) || "RAGリビルド中です。完了後に再度お試しください。");
+      e.rebuilding = true;
+      throw e;
+    }
     throw new Error(`/api/chat ${r.status}: ${err}`);
   }
   return r.json();
+}
+
+// Pull the human-readable detail out of a 423 response body. The server
+// sends {"detail": "...", "rebuilding": true} but bare strings (or HTML
+// from a misconfigured proxy) are also possible — fall back gracefully.
+function _extractRebuildMessage(body) {
+  try {
+    const j = JSON.parse(body);
+    if (j && typeof j.detail === "string") return j.detail;
+  } catch (_) { /* not JSON, fall through */ }
+  return "";
 }
 
 // ---------- TTS ----------
@@ -1344,6 +1380,7 @@ function recomputeBestBadges() {
     groups.get(gid).push({ el, score });
   }
   placeAggregateTriggers(groups, groupHasAgg);
+  placeFacrTriggers();
   for (const arr of groups.values()) {
     if (arr.length < 2) {
       for (const x of arr) {
@@ -1467,6 +1504,386 @@ async function runAggregate(groupId, btn) {
   await refreshQaTimeline();
 }
 
+// ====================================================================
+// FACR — Federated Adversarial Cross-Retrieval
+// ====================================================================
+// Orchestrator state, keyed by group_id. The button placement reads this
+// to know whether a given group already has a FACR run attached so it can
+// hide / disable the trigger after one round of cross-examination.
+const facrState = {
+  // groupId -> { rounds: [{labId, delta, stances, evidence}], confidence: {labId: cumΔ} }
+  byGroup: new Map(),
+  // groupId -> AbortController for in-flight runs (currently unused — runs
+  // are short — but reserved so a future "stop FACR" UI doesn't need a
+  // refactor).
+  inflight: new Map(),
+};
+
+const FACR_K_MAX = 2;          // outer rounds; one round = every Lab examines every peer's claim
+const FACR_EPSILON = 0.05;     // |Δ(k) − Δ(k−1)| < ε ⇒ saturate
+const FACR_DOMINANCE = 1.5;    // top-2 cumulative gap that ends the loop early
+
+// Trigger button placement. Mirrors placeAggregateTriggers: one ⚔️ per
+// fan-out group with ≥ 2 peers, anchored on the highest-scoring item so
+// the user reads it as "challenge the leader". Gets stripped + re-rendered
+// every recomputeBestBadges() pass, same as 🧬, so it self-heals after
+// late responses arrive. Unlike 🧬, ⚔️ is allowed to run *after* aggregation
+// — re-evaluating Σ Δ once a synthesized answer exists is exactly the FACR
+// use case ("does the leader's claim survive cross-examination?").
+//
+// Runs on BOTH the side panel (.qa-item under elQaBody) and the maximized
+// board (.qa-board-item under elQaBoardBody). syncQaBoard mirrors
+// data-group-id / data-top-score / data-answer-len onto the board cards so
+// the same per-group anchor logic works identically there. Each click goes
+// through the same runFACR; clicking on either copy is fine because the
+// state machine is keyed by group_id, not DOM identity.
+function placeFacrTriggers() {
+  // Re-derive groups from the side panel (which is the source of truth —
+  // the board is just a mirror). This makes the function self-contained so
+  // syncQaBoard can call it after rebuilding the board without threading
+  // a groups map across two render functions.
+  const groups = new Map();
+  for (const el of elQaBody.querySelectorAll(".qa-item:not(.empty)")) {
+    const gid = el.dataset.groupId;
+    if (!gid) continue;
+    if (el.dataset.aggregated === "1") continue;
+    const top = Number(el.dataset.topScore) || 0;
+    const len = Number(el.dataset.answerLen) || 0;
+    const score = top * 1.0 + (len / 1000) * 0.1;
+    if (!groups.has(gid)) groups.set(gid, []);
+    groups.get(gid).push({ el, score });
+  }
+  for (const btn of document.querySelectorAll(".facr-trigger")) btn.remove();
+  const panels = [
+    { container: elQaBody, itemSel: ".qa-item:not(.empty)", metaSel: ".meta" },
+    { container: elQaBoardBody, itemSel: ".qa-board-item", metaSel: ".row-meta" },
+  ];
+  for (const [gid, arr] of groups.entries()) {
+    if (arr.length < 2) continue;
+    if (facrState.byGroup.has(gid)) continue;   // FACR already ran for this group
+    let anchor = arr[0];
+    for (const x of arr) if (x.score > anchor.score) anchor = x;
+    // The side-panel anchor element is known (anchor.el). For the board we
+    // re-derive the highest-scoring card by data-group-id, since the board
+    // is rebuilt from scratch on every syncQaBoard pass and we can't keep
+    // a stable pointer to it.
+    for (const panel of panels) {
+      if (!panel.container) continue;
+      let anchorEl = null;
+      if (panel.container === elQaBody) {
+        anchorEl = anchor.el;
+      } else {
+        const cards = panel.container.querySelectorAll(
+          `${panel.itemSel}[data-group-id="${CSS.escape(gid)}"]`,
+        );
+        let best = -Infinity;
+        for (const el of cards) {
+          if (el.dataset.aggregated === "1") continue;
+          const top = Number(el.dataset.topScore) || 0;
+          const len = Number(el.dataset.answerLen) || 0;
+          const s = top * 1.0 + (len / 1000) * 0.1;
+          if (s > best) { best = s; anchorEl = el; }
+        }
+      }
+      if (!anchorEl) continue;
+      const btn = document.createElement("button");
+      btn.className = "facr-trigger";
+      btn.type = "button";
+      btn.textContent = "⚔️ FACR";
+      btn.title =
+        "Federated Adversarial Cross-Retrieval — 各 Lab を相互に反証検索させ、" +
+        "証拠増分 Δ の累積で信頼度を再評価する";
+      btn.dataset.groupId = gid;
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        runFACR(gid, btn).catch((err) => {
+          console.warn("[FACR] failed:", err);
+          setStatus(`FACR failed: ${err.message || err}`);
+          btn.disabled = false;
+        });
+      });
+      anchorEl.querySelector(panel.metaSel)?.appendChild(btn);
+    }
+  }
+}
+
+// Drive FACR over one fan-out group.
+//   inputs:  { Lab i: answer_i, top_score_i }  drawn from the DOM
+//   loop:    for k=1..K_max, for each ordered pair (i,j),
+//              call Lab_i.cross_examine(claim=A_j, prior_evidence=pool)
+//            accumulate Δ_i^(k) and grow the prior_evidence pool with
+//            whatever new chunks Lab_i surfaced (so subsequent rounds
+//            measure novelty against everything seen so far).
+//   stop:    saturation (per-Lab |Δ(k)−Δ(k−1)|<ε for everyone) OR
+//            dominance (top-2 cumulative gap ≥ FACR_DOMINANCE) OR k=K_max.
+//   output:  one synthesized FACR card injected into the timeline per
+//            group; per-Lab cumulative Δ becomes the new "confidence".
+async function runFACR(groupId, btn) {
+  const items = Array.from(
+    elQaBody.querySelectorAll(`.qa-item[data-group-id="${CSS.escape(groupId)}"]`),
+  ).filter((el) => el.dataset.aggregated !== "1");
+  if (items.length < 2) return;
+
+  // Build per-Lab participants. The "claim" sent to peers is each Lab's
+  // answer text — we treat the answer as a load-bearing assertion. (A
+  // ClaimDecomp pass would split it into atomic propositions; the MVP
+  // sends the whole answer and lets the LLM stance classifier work over
+  // the full context. This is the lowest-risk first cut.)
+  const labs = items.map((el) => {
+    const opId = el.dataset.opId || "";
+    const labId = labState.labIdByOpId[opId] || "";
+    const answer = el.querySelector(".a")?.textContent || "";
+    const top = Number(el.dataset.topScore) || 0;
+    return {
+      el,
+      opId,
+      labId,
+      label: labState.labels[opId] || labId || opId.slice(0, 6),
+      answer: answer.trim(),
+      initialTop: top,
+    };
+  }).filter((x) => x.opId && x.answer);
+  if (labs.length < 2) {
+    setStatus("FACR: need ≥ 2 Labs with answers");
+    return;
+  }
+
+  const question = items[0].querySelector(".q")?.textContent?.trim() || "";
+
+  btn.disabled = true;
+  btn.textContent = "⚔️ FACR…";
+  setStatus(`FACR: round 0 — collecting baseline (${labs.length} Labs)`);
+
+  // Cumulative Δ per Lab (this is the "confidence" in FACR terms — Σ_k Δ).
+  const cumulative = new Map(labs.map((x) => [x.opId, 0]));
+  // Running evidence pool (text snippets) shared across rounds. Seeded
+  // empty: round 1's novelty term will accept any retrieved chunk in
+  // full, then later rounds discount overlap with what's been surfaced.
+  let priorEvidence = [];
+  // Per-round telemetry the FACR card renders below.
+  const roundsLog = [];   // [{k, perLab: [{labId, delta, stances, evCount}]}]
+  let prevDeltas = new Map(labs.map((x) => [x.opId, 0]));
+
+  try {
+    for (let k = 1; k <= FACR_K_MAX; k++) {
+      setStatus(`FACR: round ${k}/${FACR_K_MAX}`);
+      // Per-round Δ accumulator. Each Lab examines every peer's claim
+      // once; the calls are independent so we issue them in parallel.
+      const calls = [];
+      for (const examiner of labs) {
+        for (const peer of labs) {
+          if (peer.opId === examiner.opId) continue;
+          calls.push((async () => {
+            const resp = await chat({
+              stage: "qa",
+              slide: currentSlidePayload(),
+              message: question,
+              operatorId: examiner.opId,
+              groupId,
+              action: "cross_examine",
+              claim: peer.answer,
+              priorEvidence,
+              roundIdx: k,
+            });
+            return { examiner, peer, resp };
+          })());
+        }
+      }
+      const settled = await Promise.allSettled(calls);
+
+      const perLabDelta = new Map(labs.map((x) => [x.opId, 0]));
+      const perLabStances = new Map(labs.map((x) => [x.opId, []]));
+      const perLabEv = new Map(labs.map((x) => [x.opId, 0]));
+      const newEvidenceTexts = [];
+      for (const s of settled) {
+        if (s.status !== "fulfilled") {
+          console.warn("[FACR] cross_examine call failed:", s.reason);
+          continue;
+        }
+        const { examiner, resp } = s.value;
+        const acc = resp?.accuracy || {};
+        const delta = Number(acc.delta) || 0;
+        perLabDelta.set(examiner.opId, (perLabDelta.get(examiner.opId) || 0) + delta);
+        const stances = Array.isArray(acc.stances) ? acc.stances : [];
+        perLabStances.get(examiner.opId).push(...stances);
+        const ev = Array.isArray(acc.evidence) ? acc.evidence : [];
+        perLabEv.set(examiner.opId, (perLabEv.get(examiner.opId) || 0) + ev.length);
+        for (const e of ev) {
+          if (e && typeof e.text === "string" && e.text.trim()) {
+            newEvidenceTexts.push(e.text.trim());
+          }
+        }
+      }
+
+      // Update cumulative confidence + log this round.
+      const roundEntry = { k, perLab: [] };
+      let saturated = true;
+      for (const lab of labs) {
+        const d = perLabDelta.get(lab.opId) || 0;
+        cumulative.set(lab.opId, (cumulative.get(lab.opId) || 0) + d);
+        const prev = prevDeltas.get(lab.opId) || 0;
+        if (Math.abs(d - prev) >= FACR_EPSILON) saturated = false;
+        prevDeltas.set(lab.opId, d);
+        roundEntry.perLab.push({
+          opId: lab.opId,
+          labId: lab.labId,
+          label: lab.label,
+          delta: d,
+          stanceSummary: summarizeStances(perLabStances.get(lab.opId) || []),
+          evCount: perLabEv.get(lab.opId) || 0,
+        });
+      }
+      roundsLog.push(roundEntry);
+
+      // Grow the prior pool. De-dup by exact text so the novelty baseline
+      // doesn't get trivially saturated by repeated identical snippets.
+      const seen = new Set(priorEvidence);
+      for (const t of newEvidenceTexts) if (!seen.has(t)) { seen.add(t); priorEvidence.push(t); }
+
+      // Dominance check — if the top-2 cumulative gap is already huge,
+      // further rounds won't change the verdict. Saves the LLM budget.
+      const sortedCum = Array.from(cumulative.values()).sort((a, b) => b - a);
+      const gap = sortedCum.length >= 2 ? (sortedCum[0] - sortedCum[1]) : 0;
+      if (gap >= FACR_DOMINANCE) {
+        setStatus(`FACR: dominant winner at round ${k} (gap=${gap.toFixed(2)})`);
+        break;
+      }
+      if (saturated && k >= 2) {
+        setStatus(`FACR: saturated at round ${k}`);
+        break;
+      }
+    }
+
+    facrState.byGroup.set(groupId, {
+      rounds: roundsLog,
+      confidence: Object.fromEntries(cumulative),
+      labs: labs.map((x) => ({ opId: x.opId, labId: x.labId, label: x.label })),
+      question,
+    });
+    renderFacrCard(groupId);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "⚔️ FACR";
+  }
+}
+
+function summarizeStances(stances) {
+  let s = 0, r = 0, n = 0;
+  for (const x of stances) {
+    if (x === "SUPPORT") s++;
+    else if (x === "REBUT") r++;
+    else n++;
+  }
+  return { support: s, rebut: r, neutral: n };
+}
+
+// Inject a FACR result card just below the group's items. Layout mirrors
+// the aggregated card visually — same border + meta bar — but the body is
+// a per-Lab cumulative Δ ranking with a small per-round breakdown so the
+// audience can see the "evidence gradient" in action.
+function renderFacrCard(groupId) {
+  const state = facrState.byGroup.get(groupId);
+  if (!state) return;
+  // Drop any prior card for this group so re-runs replace cleanly.
+  for (const old of elQaBody.querySelectorAll(
+    `.facr-card[data-group-id="${CSS.escape(groupId)}"]`)) {
+    old.remove();
+  }
+  const card = document.createElement("div");
+  card.className = "facr-card";
+  card.dataset.groupId = groupId;
+
+  const head = document.createElement("div");
+  head.className = "facr-head";
+  const title = document.createElement("span");
+  title.className = "facr-title";
+  title.textContent = "⚔️ FACR — 信頼度 = Σ Δ_evidence";
+  head.appendChild(title);
+  const sub = document.createElement("span");
+  sub.className = "facr-sub";
+  sub.textContent = ` rounds=${state.rounds.length}, ε=${FACR_EPSILON}, dominance=${FACR_DOMINANCE}`;
+  head.appendChild(sub);
+  card.appendChild(head);
+
+  // Ranking row (cumulative Δ, descending). The Lab with the highest cum-Δ
+  // is the "most defensible under cross-examination" — the FACR analogue
+  // of ★ best, but earned by withstanding rebuttal rather than by initial
+  // reranker score.
+  const ranks = [...state.labs].map((l) => ({
+    ...l,
+    cum: Number(state.confidence[l.opId]) || 0,
+  })).sort((a, b) => b.cum - a.cum);
+
+  const rank = document.createElement("div");
+  rank.className = "facr-rank";
+  for (let i = 0; i < ranks.length; i++) {
+    const r = ranks[i];
+    const row = document.createElement("div");
+    row.className = "facr-rank-row";
+    if (i === 0) row.classList.add("facr-winner");
+    const pos = document.createElement("span");
+    pos.className = "facr-pos";
+    pos.textContent = `${i + 1}.`;
+    const lab = document.createElement("span");
+    lab.className = "facr-lab";
+    lab.textContent = r.label;
+    const cum = document.createElement("span");
+    cum.className = "facr-cum";
+    const sign = r.cum > 0 ? "+" : "";
+    cum.textContent = `Σ Δ = ${sign}${r.cum.toFixed(3)}`;
+    if (r.cum > 0) cum.classList.add("pos");
+    if (r.cum < 0) cum.classList.add("neg");
+    row.append(pos, lab, cum);
+    rank.appendChild(row);
+  }
+  card.appendChild(rank);
+
+  // Per-round breakdown — a compact table so the gradient is legible.
+  const grid = document.createElement("div");
+  grid.className = "facr-grid";
+  const header = document.createElement("div");
+  header.className = "facr-grid-row facr-grid-head";
+  header.appendChild(facrCell("k", "facr-cell-k"));
+  for (const lab of state.labs) header.appendChild(facrCell(lab.label, "facr-cell-lab"));
+  grid.appendChild(header);
+  for (const round of state.rounds) {
+    const row = document.createElement("div");
+    row.className = "facr-grid-row";
+    row.appendChild(facrCell(`#${round.k}`, "facr-cell-k"));
+    for (const lab of state.labs) {
+      const entry = round.perLab.find((p) => p.opId === lab.opId);
+      const d = entry ? entry.delta : 0;
+      const sign = d > 0 ? "+" : "";
+      const cell = facrCell(`${sign}${d.toFixed(3)}`, "facr-cell-delta");
+      if (d > 0) cell.classList.add("pos");
+      if (d < 0) cell.classList.add("neg");
+      if (entry) {
+        const ss = entry.stanceSummary;
+        cell.title =
+          `Δ=${d.toFixed(4)}  ` +
+          `support=${ss.support} rebut=${ss.rebut} neutral=${ss.neutral}  ` +
+          `evidence=${entry.evCount}`;
+      }
+      row.appendChild(cell);
+    }
+    grid.appendChild(row);
+  }
+  card.appendChild(grid);
+
+  // Anchor: append to the end of the QA body so it sits below the group's
+  // items. (The group is contiguous in DOM order because timeline merges
+  // by ts and items in one fan-out arrive within the same poll cycle.)
+  elQaBody.appendChild(card);
+  elQaBody.scrollTop = elQaBody.scrollHeight;
+}
+
+function facrCell(text, cls) {
+  const el = document.createElement("span");
+  el.className = `facr-cell ${cls || ""}`.trim();
+  el.textContent = text;
+  return el;
+}
+
 // Mirror the right-side QA panel into the maximized center-area board.
 // Source of truth is elQaBody (the side panel) — we read every qa-item +
 // dataset flag the timeline already sets (best/aggregated/topScore/opId)
@@ -1482,14 +1899,23 @@ function syncQaBoard() {
     return;
   }
   elQaBoardBody.classList.remove("qa-board-empty");
-  const wasAtBottom =
-    elQaBoardBody.scrollHeight - elQaBoardBody.scrollTop - elQaBoardBody.clientHeight < 24;
+  // Maximized board renders newest-first (the side panel keeps oldest-first
+  // because it auto-scrolls down on each new turn). "Stick to top" replaces
+  // the side panel's "stick to bottom" behavior.
+  const wasAtTop = elQaBoardBody.scrollTop < 24;
   const frag = document.createDocumentFragment();
-  for (const src of items) {
+  for (const src of items.slice().reverse()) {
     const card = document.createElement("div");
     card.className = "qa-board-item";
     if (src.dataset.aggregated === "1") card.classList.add("is-aggregated");
     if (src.classList.contains("is-best")) card.classList.add("is-best");
+    // Carry forward enough metadata that placeFacrTriggers can find the
+    // anchor card on the board (group_id for grouping, top_score / answer_len
+    // to break ties exactly the way recomputeBestBadges does).
+    if (src.dataset.groupId) card.dataset.groupId = src.dataset.groupId;
+    if (src.dataset.topScore) card.dataset.topScore = src.dataset.topScore;
+    if (src.dataset.answerLen) card.dataset.answerLen = src.dataset.answerLen;
+    if (src.dataset.aggregated) card.dataset.aggregated = src.dataset.aggregated;
 
     const meta = document.createElement("div");
     meta.className = "row-meta";
@@ -1548,7 +1974,11 @@ function syncQaBoard() {
     frag.appendChild(card);
   }
   elQaBoardBody.replaceChildren(frag);
-  if (wasAtBottom) elQaBoardBody.scrollTop = elQaBoardBody.scrollHeight;
+  if (wasAtTop) elQaBoardBody.scrollTop = 0;
+  // Board cards just got rebuilt — re-place ⚔️ buttons on whichever
+  // anchors now exist over here. recomputeBestBadges already placed them
+  // on the side panel.
+  placeFacrTriggers();
 }
 
 if (elQaMaximize) {
@@ -1676,6 +2106,19 @@ async function refreshLabs() {
         const tag = document.createElement("span");
         tag.className = "lab-auth-tag";
         tag.textContent = (auth === "pending") ? "🔒 認証中…" : "🔒 未認証";
+        head.append(tag);
+      }
+
+      // RAG rebuild banner. While `lab.rebuilding` is true, the lab's
+      // GPU is busy with build_paper_index.py + reload_index, so the
+      // server 423s every question/upload/tech-memo call. Show a
+      // visible badge in place of the summary so the user understands
+      // why those actions silently look unavailable.
+      if (lab.rebuilding) {
+        row.classList.add("lab-rebuilding");
+        const tag = document.createElement("span");
+        tag.className = "lab-rebuild-tag";
+        tag.textContent = "🔄 RAGリビルド中…";
         head.append(tag);
       }
 
@@ -1970,6 +2413,18 @@ async function fanOutQa(question, labs) {
   ));
   const ok = results.filter((r) => r.status === "fulfilled").length;
   const failed = results.length - ok;
+  // Surface 423 RAG-rebuild rejections as a banner — Promise.allSettled
+  // would otherwise hide them under the "asked N/M (X failed)" status.
+  const rebuildingLabs = results
+    .map((r, i) => ({ r, opId: labs[i] }))
+    .filter(({ r }) => r.status === "rejected" && r.reason && r.reason.rebuilding)
+    .map(({ opId }) => labState.labels[opId] || opId);
+  if (rebuildingLabs.length) {
+    alert(
+      `RAGリビルド中の Lab には質問できません: ${rebuildingLabs.join(" / ")}\n` +
+      "リビルド完了後に再度お試しください。"
+    );
+  }
   setStatus(failed
     ? `asked ${ok}/${labs.length} labs (${failed} failed)`
     : `asked ${ok}/${labs.length} labs ✓`);
@@ -3079,12 +3534,26 @@ btnPaperDelete.addEventListener("click", async () => {
 
   setStatus(`loading…  (${DISPLAY_NAME})`);
   try {
-    const [deck, config] = await Promise.all([
+    // allSettled, not Promise.all: a Lab that hasn't generated slides yet
+    // returns 404 for /api/deck, but we still want /api/config (which
+    // carries tts_url, voice options, etc.) to land. Promise.all would
+    // reject the whole boot on the first 404, leaving tts_url undefined.
+    const [deckRes, configRes] = await Promise.allSettled([
       apiGet("/api/deck"),
       apiGet("/api/config"),
     ]);
-    state.deck = deck;
-    state.config = config;
+    if (deckRes.status === "fulfilled") {
+      state.deck = deckRes.value;
+    } else {
+      console.warn("[boot] /api/deck failed:", deckRes.reason?.message || deckRes.reason);
+      state.deck = { pages: [] };
+    }
+    if (configRes.status === "fulfilled") {
+      state.config = configRes.value;
+    } else {
+      console.warn("[boot] /api/config failed:", configRes.reason?.message || configRes.reason);
+      state.config = {};
+    }
     // Per-tab UX: every browser load starts blank. The user picks a
     // paper from the dropdown (or uploads one) to populate the header.
     // Server-side `current_meta` still drives /api/chat persona — that

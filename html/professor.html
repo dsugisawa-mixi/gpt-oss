@@ -110,6 +110,11 @@
     padding: 28px 32px;
     display: flex; flex-direction: column;
     overflow-y: auto;
+    /* Grid item default min-height is auto (= content), which lets the
+       cell grow with the QA list and silently disables every inner
+       overflow:auto below. min-height:0 forces the cell to honor the
+       grid track height so #qa-board-body can actually scroll. */
+    min-height: 0;
   }
   #slide .page-num { color: #98a0c0; font-size: 0.85em; margin-bottom: 10px; }
   #slide h2 { font-size: 1.6em; color: #f5f5fa; margin-bottom: 18px; line-height: 1.3; }
@@ -247,6 +252,27 @@
   .lab-row .lab-meta {
     color: #6a7392; font-size: 0.74em; margin-top: 4px;
   }
+  /* RAG rebuild badge — placed in the lab head row alongside the name.
+     Eye-catching enough that the user notices "this lab can't take a
+     question right now" without us disabling the row click outright. */
+  .lab-row .lab-rebuild-tag {
+    margin-left: 6px;
+    font-size: 0.78em; line-height: 1;
+    color: #1a1408;
+    background: #f3c34a;
+    border: 1px solid #b48a1a;
+    padding: 2px 7px; border-radius: 10px;
+    font-weight: 700;
+    animation: lab-rebuild-pulse 1.4s ease-in-out infinite;
+  }
+  .lab-row.lab-rebuilding {
+    border-color: #6a5018;
+    box-shadow: 0 0 0 1px rgba(243, 195, 74, 0.18);
+  }
+  @keyframes lab-rebuild-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
+  }
   .user-row {
     display: flex; align-items: flex-start; gap: 8px;
     padding: 6px 4px;
@@ -352,6 +378,72 @@
   }
   .qa-item .meta .agg-trigger:hover { border-color: #6a4ab0; color: #fff; }
   .qa-item .meta .agg-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* FACR (Federated Adversarial Cross-Retrieval) trigger + result card.
+     Trigger sits next to 🧬 統合; the result card lands below the group's
+     items and shows the cumulative Δ ranking + per-round gradient. */
+  .qa-item .meta .facr-trigger {
+    background: #2a1a14; color: #ffd0b8;
+    border: 1px solid #5a3a2a; border-radius: 10px;
+    font-size: 0.85em; font-weight: 600;
+    padding: 1px 8px; cursor: pointer;
+  }
+  .qa-item .meta .facr-trigger:hover { border-color: #b06a4a; color: #fff; }
+  .qa-item .meta .facr-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
+  .facr-card {
+    margin: 8px 0;
+    padding: 10px 12px;
+    background: rgba(40, 20, 15, 0.55);
+    border: 1px solid #5a3a2a;
+    border-left: 3px solid #c47652;
+    border-radius: 8px;
+    color: #f0d8c8;
+    font-size: 0.9em;
+  }
+  .facr-card .facr-head {
+    display: flex; align-items: baseline; gap: 6px;
+    margin-bottom: 6px;
+  }
+  .facr-card .facr-title { font-weight: 700; color: #ffd0b8; }
+  .facr-card .facr-sub { color: #a08878; font-size: 0.85em; }
+  .facr-card .facr-rank {
+    display: flex; flex-direction: column; gap: 2px;
+    margin-bottom: 8px;
+  }
+  .facr-card .facr-rank-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 2px 4px; border-radius: 4px;
+  }
+  .facr-card .facr-rank-row.facr-winner {
+    background: rgba(196, 118, 82, 0.18);
+    border: 1px solid rgba(196, 118, 82, 0.45);
+  }
+  .facr-card .facr-pos { color: #a08878; width: 1.4em; }
+  .facr-card .facr-lab { color: #f0d8c8; flex: 1; font-weight: 600; }
+  .facr-card .facr-cum { font-variant-numeric: tabular-nums; font-weight: 700; }
+  .facr-card .facr-cum.pos { color: #6ad88a; }
+  .facr-card .facr-cum.neg { color: #e88080; }
+  .facr-card .facr-grid {
+    display: flex; flex-direction: column; gap: 1px;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 4px;
+    overflow: hidden;
+    font-size: 0.85em;
+  }
+  .facr-card .facr-grid-row {
+    display: flex; align-items: center;
+    background: rgba(40, 20, 15, 0.4);
+  }
+  .facr-card .facr-grid-row.facr-grid-head {
+    background: rgba(60, 40, 30, 0.6);
+    color: #ffd0b8; font-weight: 600;
+  }
+  .facr-card .facr-cell {
+    padding: 3px 8px; flex: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .facr-card .facr-cell-k { flex: 0 0 2.5em; color: #a08878; }
+  .facr-card .facr-cell-delta.pos { color: #6ad88a; }
+  .facr-card .facr-cell-delta.neg { color: #e88080; }
   .qa-item .meta .qa-speak {
     background: none; border: 1px solid #2a3a5a; color: #cfd5e6;
     border-radius: 50%;
@@ -492,6 +584,10 @@
     border: 1px solid #1a2245;
     border-radius: 10px;
     overflow: hidden;
+    /* #qa-board-body is a flex column. Without this, cards get squashed
+       to fit the viewport and the body never overflows → outer scroll
+       silently breaks once you have more than a handful of items. */
+    flex-shrink: 0;
   }
   .qa-board-item .row-meta {
     display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
@@ -525,12 +621,19 @@
     padding: 10px 14px;
     color: #f0a8b6; font-size: 1.05em; line-height: 1.55;
     border-bottom: 1px solid rgba(255,255,255,0.04);
+    /* ~2 lines visible (1.55em × 2 ≈ 3.1em); longer Q scrolls inside. */
+    max-height: 3.2em;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
   }
   .qa-board-item .row-q:before { content: "Q "; color: #e94560; font-weight: 700; }
   .qa-board-item .row-a {
     padding: 12px 14px 14px;
     color: #d5d8e8; font-size: 1em; line-height: 1.65;
     white-space: pre-wrap; word-break: break-word;
+    /* ~3 lines visible (1.65em × 3 ≈ 5em); longer A scrolls inside. */
+    max-height: 5em;
+    overflow-y: auto;
   }
   .qa-board-item .row-a:before { content: "A "; color: #5ad08b; font-weight: 700; }
   .qa-board-item.is-aggregated { border-color: #4a3a6a; box-shadow: 0 0 0 1px rgba(180, 140, 240, 0.25); }
