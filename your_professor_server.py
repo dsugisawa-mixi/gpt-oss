@@ -2022,11 +2022,18 @@ def _build_lab_summary_payload() -> dict:
     Used by the multi-lab fan-out flow: tunnel_client fetches this and posts it
     to the proxy via update_operator."""
     meta = None
+    recent_additions: list[dict] = []
     if _paper_rag is not None:
         try:
             meta = _paper_rag.get_index_meta()
         except Exception:
             logger.exception("paper_rag.get_index_meta failed")
+        try:
+            # Last 7 days of new-paper bullets, surfaced on the LAB list
+            # card so users see what knowledge entered this corpus recently.
+            recent_additions = _paper_rag.get_daily_additions(window_days=7)
+        except Exception:
+            logger.exception("paper_rag.get_daily_additions failed")
     by_type = (meta or {}).get("by_type", {}) or {}
     papers_count = sum(by_type.get(k, 0) for k in ("paper", "preprint", "patent"))
 
@@ -2062,6 +2069,9 @@ def _build_lab_summary_payload() -> dict:
         # GUI gates question/upload/tech-memo while True and shows a
         # "🔄 RAGリビルド中…" badge on the corresponding lab card.
         "rebuilding": _rag_rebuilding,
+        # Per-day "what knowledge entered this corpus" bullets, newest-first,
+        # last 7 days. Empty list if record_daily_additions.py has never run.
+        "recent_additions": recent_additions,
     }
 
 

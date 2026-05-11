@@ -225,6 +225,45 @@ def get_index_meta() -> Optional[dict]:
         return dict(_index_meta) if _index_meta else None
 
 
+def get_daily_additions(window_days: int = 7) -> list[dict]:
+    """Return the most recent N daily-addition records, newest first.
+
+    The file is written by record_daily_additions.py at the end of each
+    cron rebuild — shape: {"YYYYMMDD": {"built_at": int, "added_count":
+    int, "items": [{arxiv_id, title, brief, authors_short}, ...]}, ...}.
+
+    Returns a list of {"date", "built_at", "added_count", "items"} dicts.
+    No swap_lock — this file is independent of the live LanceDB index,
+    so reads can't tear with reload_index(). Returns [] silently when
+    the file doesn't exist (first deploy, or rebuild never ran with the
+    new pipeline) so the GUI just shows an empty section."""
+    path = INDEX_DIR / "daily_additions.json"
+    if not path.exists():
+        return []
+    try:
+        import json
+        store = json.loads(path.read_text())
+    except Exception:
+        logger.exception("paper_rag: failed to parse %s", path)
+        return []
+    if not isinstance(store, dict):
+        return []
+    # YYYYMMDD keys sort lexicographically same as chronologically.
+    recent_keys = sorted(store.keys(), reverse=True)[:max(0, window_days)]
+    out: list[dict] = []
+    for k in recent_keys:
+        entry = store.get(k) or {}
+        if not isinstance(entry, dict):
+            continue
+        out.append({
+            "date": k,
+            "built_at": entry.get("built_at"),
+            "added_count": entry.get("added_count", 0),
+            "items": entry.get("items", []),
+        })
+    return out
+
+
 def embed_texts(texts: list[str]):
     """Encode a batch of strings with the same embedder used for queries,
     returning an L2-normalized numpy array of shape (n, dim) or None if

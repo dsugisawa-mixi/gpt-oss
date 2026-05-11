@@ -252,6 +252,62 @@
   .lab-row .lab-meta {
     color: #6a7392; font-size: 0.74em; margin-top: 4px;
   }
+  /* "What knowledge entered this corpus" panel — collapsed by default so the
+     LAB row stays scannable, expanded on demand to show per-day bullets. */
+  .lab-row .lab-additions {
+    margin-top: 6px;
+    border-top: 1px dashed #2a3148;
+    padding-top: 6px;
+  }
+  .lab-row .lab-additions-summary {
+    cursor: pointer;
+    color: #9fb4d4;
+    font-size: 0.8em;
+    list-style: none;
+    user-select: none;
+    padding: 2px 0;
+  }
+  .lab-row .lab-additions-summary::-webkit-details-marker { display: none; }
+  .lab-row .lab-additions-summary::before {
+    content: "▸ ";
+    color: #6a7392;
+    transition: transform 0.15s;
+    display: inline-block;
+  }
+  .lab-row .lab-additions[open] > .lab-additions-summary::before {
+    content: "▾ ";
+  }
+  .lab-row .lab-additions-day {
+    margin: 6px 0 8px;
+  }
+  .lab-row .lab-additions-date {
+    color: #8a93b0; font-size: 0.76em; font-weight: 600;
+    margin-bottom: 3px;
+  }
+  .lab-row .lab-additions-list {
+    margin: 0; padding-left: 16px;
+    list-style: disc outside;
+    color: #cfd5e6; font-size: 0.8em;
+  }
+  .lab-row .lab-additions-list li {
+    margin-bottom: 6px;
+    word-break: break-word;
+  }
+  .lab-row .lab-additions-list a {
+    color: #b8d4ff; text-decoration: none;
+  }
+  .lab-row .lab-additions-list a:hover { text-decoration: underline; }
+  .lab-row .lab-additions-id {
+    color: #6a7392; font-size: 0.88em;
+  }
+  .lab-row .lab-additions-brief {
+    color: #8a93b0; font-size: 0.92em;
+    margin-top: 2px;
+  }
+  .lab-row.selected .lab-additions-summary { color: #d8bfc8; }
+  .lab-row.selected .lab-additions-date { color: #c89aa8; }
+  .lab-row.selected .lab-additions-list { color: #ecd7df; }
+  .lab-row.selected .lab-additions-brief { color: #c89aa8; }
   /* RAG rebuild badge — placed in the lab head row alongside the name.
      Eye-catching enough that the user notices "this lab can't take a
      question right now" without us disabling the row click outright. */

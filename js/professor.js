@@ -1999,6 +1999,87 @@ function _formatTimestamp(unix) {
   return d.toLocaleDateString();
 }
 
+// "YYYYMMDD" → "YYYY-MM-DD" for human-readable group headers in the
+// recent-additions panel. Returns the input verbatim on a bad shape so a
+// future server-side format change doesn't blank the GUI.
+function _formatDateKey(k) {
+  const m = String(k).match(/^(\d{4})(\d{2})(\d{2})$/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : String(k);
+}
+
+// arXiv abstract page; opens in a new tab so we don't steal the user's
+// session in the Lab GUI.
+function _arxivAbsHref(id) { return `https://arxiv.org/abs/${encodeURIComponent(id)}`; }
+
+// Build the collapsible "📚 最近7日の追加" block for one LAB row.
+// Payload shape (from /api/lab/summary):
+//   recent_additions: [
+//     { date: "YYYYMMDD", built_at: int|null, added_count: int,
+//       items: [{ arxiv_id, title, brief?, authors_short? }, ...] },
+//     ... newest first ...
+//   ]
+// Returns null when there's nothing to show — callers skip the append.
+function renderRecentAdditions(recent) {
+  if (!Array.isArray(recent) || recent.length === 0) return null;
+  const total = recent.reduce((s, d) => s + (d.added_count | 0), 0);
+  if (total <= 0) return null;
+
+  const wrap = document.createElement("details");
+  wrap.className = "lab-additions";
+  // Clicks/keystrokes inside the panel must not bubble up to the row's
+  // toggleLab() handler — otherwise expanding the panel also toggles the
+  // Lab's selection.
+  const swallow = (e) => e.stopPropagation();
+  wrap.addEventListener("click", swallow);
+  wrap.addEventListener("keydown", swallow);
+
+  const sum = document.createElement("summary");
+  sum.className = "lab-additions-summary";
+  const dayCount = recent.length;
+  sum.textContent = `📚 直近${dayCount}日の追加: ${total} 本`;
+  wrap.append(sum);
+
+  for (const day of recent) {
+    if (!day || !Array.isArray(day.items) || day.items.length === 0) continue;
+    const dayBlock = document.createElement("div");
+    dayBlock.className = "lab-additions-day";
+
+    const dayHead = document.createElement("div");
+    dayHead.className = "lab-additions-date";
+    dayHead.textContent = `${_formatDateKey(day.date)} (${day.items.length})`;
+    dayBlock.append(dayHead);
+
+    const ul = document.createElement("ul");
+    ul.className = "lab-additions-list";
+    for (const it of day.items) {
+      const li = document.createElement("li");
+      // Title is a link to arXiv; the rest stays text. We do NOT trust the
+      // server payload as HTML (textContent everywhere) — these strings flow
+      // from arXiv abstracts via record_daily_additions.py.
+      const a = document.createElement("a");
+      a.href = _arxivAbsHref(it.arxiv_id || "");
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = it.title || it.arxiv_id || "(no title)";
+      li.append(a);
+      const idSpan = document.createElement("span");
+      idSpan.className = "lab-additions-id";
+      idSpan.textContent = ` (${it.arxiv_id || "?"})`;
+      li.append(idSpan);
+      if (it.brief) {
+        const briefSpan = document.createElement("div");
+        briefSpan.className = "lab-additions-brief";
+        briefSpan.textContent = it.brief;
+        li.append(briefSpan);
+      }
+      ul.append(li);
+    }
+    dayBlock.append(ul);
+    wrap.append(dayBlock);
+  }
+  return wrap;
+}
+
 async function refreshLabs() {
   // /api/tunnel/info is served directly by the proxy (not forwarded through
   // the tunnel) — no auth header needed. operator.lab is populated by the
@@ -2132,7 +2213,13 @@ async function refreshLabs() {
       const model = trust.embed_model || "—";
       meta.textContent = `index ${updated} · ${model}`;
 
+      // "What knowledge entered this corpus in the last 7 days" — collapsed
+      // by default; expanding it must not toggle Lab selection, so stop the
+      // bubbling click from reaching the row-level toggleLab() handler.
+      const additionsEl = renderRecentAdditions(lab.recent_additions);
+
       row.append(head, summary, meta);
+      if (additionsEl) row.append(additionsEl);
       if (interactive) {
         const onToggle = () => toggleLab(op.id);
         row.addEventListener("click", onToggle);

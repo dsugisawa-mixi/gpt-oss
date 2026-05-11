@@ -82,7 +82,7 @@ RUN source /opt/conda/etc/profile.d/conda.sh && conda activate professor \
     && python -m pip install --no-cache-dir --no-build-isolation -e .
 
 # --- Server source: HTTP server + RAG + index builder + frontend assets ---
-COPY your_professor_server.py paper_rag.py build_paper_index.py ./
+COPY your_professor_server.py paper_rag.py build_paper_index.py record_daily_additions.py ./
 COPY html/ ./html/
 COPY js/ ./js/
 
