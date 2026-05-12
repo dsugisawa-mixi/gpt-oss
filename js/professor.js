@@ -1678,9 +1678,45 @@ async function runFACR(groupId, btn) {
   // Cumulative Δ per Lab (this is the "confidence" in FACR terms — Σ_k Δ).
   const cumulative = new Map(labs.map((x) => [x.opId, 0]));
   // Running evidence pool (text snippets) shared across rounds. Seeded
-  // empty: round 1's novelty term will accept any retrieved chunk in
-  // full, then later rounds discount overlap with what's been surfaced.
+  // from each Lab's baseline retrieval against the question BEFORE round 1
+  // — without this seed, novelty(round 1) ≡ 1.0 and Δ collapsed to
+  // Σ relevance · support, inflating whichever Lab had higher corpus
+  // density on the topic (observed: Network +1.76 vs Arxiv +0.54 in round
+  // 1 alone). The seed pass is retrieve-only (action=facr_baseline) so it
+  // doesn't burn LLM budget — each Lab returns up to top_k chunks for
+  // the audience question, we union the texts (de-dup by exact match)
+  // and feed that as round-1's novelty baseline.
   let priorEvidence = [];
+  try {
+    const seedCalls = labs.map((lab) => (async () => {
+      const resp = await chat({
+        stage: "qa",
+        slide: currentSlidePayload(),
+        message: question,
+        operatorId: lab.opId,
+        groupId,
+        action: "facr_baseline",
+      });
+      const ev = Array.isArray(resp?.accuracy?.evidence) ? resp.accuracy.evidence : [];
+      return ev.map((e) => (e && typeof e.text === "string") ? e.text.trim() : "")
+               .filter(Boolean);
+    })());
+    const seedResults = await Promise.allSettled(seedCalls);
+    const seen = new Set();
+    for (const r of seedResults) {
+      if (r.status !== "fulfilled") {
+        console.warn("[FACR] baseline call failed:", r.reason);
+        continue;
+      }
+      for (const t of r.value) if (!seen.has(t)) { seen.add(t); priorEvidence.push(t); }
+    }
+    setStatus(`FACR: baseline seeded (${priorEvidence.length} chunks across ${labs.length} Labs)`);
+  } catch (err) {
+    // Non-fatal: if the baseline pass fails entirely we degrade to the
+    // old behavior (round-1 novelty=1.0). Log so the inflation reappears
+    // visibly in the rounds card instead of silently.
+    console.warn("[FACR] baseline seeding failed, falling back to empty prior:", err);
+  }
   // Per-round telemetry the FACR card renders below.
   const roundsLog = [];   // [{k, perLab: [{labId, delta, stances, evCount}]}]
   let prevDeltas = new Map(labs.map((x) => [x.opId, 0]));

@@ -429,6 +429,9 @@ class ChatRequest(BaseModel):
     # independent answer + sigmoid-confidence) into one weighted reply.
     # "cross_examine" = FACR rebuttal pass: re-search this Lab's corpus
     # against a peer Lab's claim, score relevance·novelty·support, return Δ.
+    # "facr_baseline" = FACR seed pass: retrieve-only against THIS Lab's
+    # corpus using the question, no LLM. Used by the orchestrator to
+    # populate prior_evidence before round 1 so novelty is non-degenerate.
     action: str = ""
     # Synthesis inputs for action=aggregate. Each entry: {answer, lab_id, score}
     # where score is the 0-1 sigmoid-of-top_score from the contributing Lab.
@@ -1397,12 +1400,28 @@ def _facr_cross_examine(
     try:
         msgs = _build_cross_exam_messages(question, claim, new_texts)
         # gpt-oss spends most of its budget in the analysis channel before
-        # emitting the final JSON; observed round-1 was out=256, final=0
-        # — i.e. reasoning ate the whole 256-token budget and the stance
-        # array never got written. 1024 leaves comfortable headroom for
-        # ~750 reasoning tokens + the short JSON array we actually need.
-        verdict, _trunc = generate_reply(msgs, max_new_tokens=1024, max_reply_tokens=200)
+        # emitting the final JSON; 1024 was tight enough that round-2 calls
+        # against a deep prior_evidence pool consumed the whole budget on
+        # reasoning and emitted final=0 → every stance silently defaulted to
+        # NEUTRAL → Δ=0, which is indistinguishable from "no signal" and
+        # let the silent Lab get a free pass in cumulative scoring. 2048
+        # gives ~1700 reasoning headroom + room for the short JSON verdict.
+        verdict, truncated = generate_reply(msgs, max_new_tokens=2048, max_reply_tokens=200)
         stances = _parse_stance_json(verdict, len(new_texts))
+        # Empty-final detector: if the verdict text never contains '[' we
+        # know the JSON array was never emitted (parse path returns all
+        # NEUTRAL on this). Retry once with a larger budget so a single
+        # over-thinking round doesn't permanently zero this Lab's Δ.
+        parse_failed = ("[" not in (verdict or ""))
+        if parse_failed and truncated:
+            logger.warning(
+                "FACR: stance LLM produced no final array at 2048 tok; "
+                "retrying with 3072"
+            )
+            verdict2, _ = generate_reply(msgs, max_new_tokens=3072, max_reply_tokens=300)
+            stances2 = _parse_stance_json(verdict2, len(new_texts))
+            if any(s != "NEUTRAL" for s in stances2):
+                stances = stances2
     except Exception:
         logger.exception("FACR: stance LLM call failed; defaulting to NEUTRAL")
         stances = ["NEUTRAL"] * len(new_texts)
@@ -1744,6 +1763,43 @@ async def chat(req: ChatRequest):
         return JSONResponse(
             status_code=400,
             content={"detail": f"invalid stage: {req.stage!r}. expected one of {VALID_STAGES}"},
+        )
+
+    # FACR baseline seeding. Pure retrieval against THIS Lab's corpus using
+    # the audience question — no LLM, no stance, no Δ. The orchestrator
+    # collects each Lab's baseline chunks and unions them into the
+    # prior_evidence pool BEFORE round 1, so the novelty term in round-1's
+    # Δ = Σ relevance · novelty · support is non-trivial from the start.
+    # Without this seed, round 1 ran with prior_evidence=[] → novelty≡1 →
+    # Δ collapsed to Σ relevance · support, which inflated whichever Lab
+    # happened to have higher corpus density on the topic (observed:
+    # Network's round-1 Δ=+1.76 vs Arxiv's +0.54, before novelty discount
+    # could correct it).
+    if req.action == "facr_baseline":
+        question = (req.message or "").strip()
+        hits = retrieve_knowledge(question, top_k=4) if question else []
+        evidence_out = [{
+            "title": h.get("title", ""),
+            "source": h.get("source", ""),
+            "text": (h.get("text") or "")[:400],
+            "score": float(h.get("score", 0.0)),
+        } for h in hits]
+        _touch_presence(req.user_id)
+        return ChatResponse(
+            user_id=req.user_id,
+            reply=f"FACR baseline: {len(evidence_out)} chunk(s) seeded",
+            stage=req.stage,
+            slide_page=req.slide.page if req.slide else None,
+            voice=(req.voice or "male"),
+            lab_id=LAB_ID,
+            accuracy={
+                "rag_hits": len(evidence_out),
+                "top_score": 0.0,
+                "mean_score": 0.0,
+                "facr": True,
+                "facr_baseline": True,
+                "evidence": evidence_out,
+            },
         )
 
     # FACR cross-examination path. The orchestrator (browser) sends one
