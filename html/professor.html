@@ -33,6 +33,34 @@
     padding: 16px;
     overflow: hidden;
   }
+  /* Mobile (iPhone/iOS/Android): JS sets body.mobile-mode based on UA.
+     We drop the avatar column, the slide pane, and every footer control
+     that drives presentation flow / uploads / paper selection — leaving
+     just the side panel (参加者 / Lab / 質疑応答), the QA input, Ask,
+     status, and logout. PC layout is unchanged. */
+  body.mobile-mode main {
+    grid-template-columns: 1fr;
+  }
+  body.mobile-mode header,
+  body.mobile-mode #avatar,
+  body.mobile-mode #slide,
+  body.mobile-mode #btn-prev,
+  body.mobile-mode #btn-speak,
+  body.mobile-mode #btn-next,
+  body.mobile-mode #btn-end,
+  body.mobile-mode #btn-upload,
+  body.mobile-mode #btn-memo,
+  body.mobile-mode #paper-library,
+  body.mobile-mode #btn-paper-apply,
+  body.mobile-mode #btn-paper-delete,
+  body.mobile-mode #upload-indicator,
+  body.mobile-mode #qa-maximize { display: none !important; }
+  /* Portrait phone: QA input owns row 1, leaving Ask + status + Logout
+     to wrap together onto row 2. footer is flex-wrap: wrap; the input's
+     PC rule sets `flex: 1` (= flex-shrink: 1), which lets it squeeze so
+     Ask stays on the same line — we override with `flex: 0 0 100%` to
+     pin it to a full line and force the rest to wrap. */
+  body.mobile-mode #qa-input { flex: 0 0 100%; min-width: 0; }
   #avatar {
     border-radius: 12px;
     border: 1px solid #3a4870;
@@ -980,7 +1008,7 @@
   <span id="upload-indicator" title="生成中のジョブを表示"><span class="spinner"></span><span id="upload-indicator-text">処理中…</span></span>
   <input type="file" id="file-paper" accept="application/pdf" hidden />
   <div class="status" id="status">idle</div>
-  <button id="btn-logout" title="サインアウト">ログアウト</button>
+  <button id="btn-logout" title="サインアウト">Logout</button>
 </footer>
 
 <div id="upload-overlay">

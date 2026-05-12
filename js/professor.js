@@ -2,8 +2,6 @@
 // Runs in the browser (S3-hosted). All API calls are relative; the tunnel
 // in front of S3 routes /chat /deck /config to your_professor_server.
 
-import * as THREE from "three";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import {
   ensureGoogleSignIn,
   signInWithLab,
@@ -11,6 +9,15 @@ import {
   getUserIdMap,
   clearStoredSession,
 } from "./auth.js";
+
+// Mobile (iPhone/iOS/Android): we strip the UI down to 参加者 / Lab一覧 /
+// 質疑応答 + the QA input, Ask, status, and logout buttons. The 3D avatar
+// (three.js + GLTFLoader + /model/professor.glb), the slide pane, and the
+// presentation/upload footer controls are all removed via body.mobile-mode
+// (CSS in professor.html). Three.js is also imported dynamically inside
+// initAvatar() so the module is never fetched on mobile.
+const IS_MOBILE = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+if (IS_MOBILE) document.body.classList.add("mobile-mode");
 
 // AbortError is our expected control-flow signal whenever the user pauses
 // (Speak), raises a hand, or navigates mid-speech. It's caught at every
@@ -109,7 +116,7 @@ const state = {
   speaking: false,
   mixer: null,
   actions: { idleList: [], speakList: [], current: null },
-  clock: new THREE.Clock(),
+  clock: null,
   // Per-slide speaker script (from generate_scripts.py), and which slide
   // index in the iframe is currently shown. When scriptSlides is present
   // the Speak button reads its lines line-by-line via TTS instead of
@@ -637,7 +644,21 @@ async function speakChunk(text, voice) {
 }
 
 // ---------- GLB / Three.js ----------
-function initAvatar() {
+async function initAvatar() {
+  // Skip entirely on mobile — see IS_MOBILE comment at top of file. We
+  // bail before any dynamic import so three.js and GLTFLoader are never
+  // fetched, and /model/professor.glb is never requested.
+  if (IS_MOBILE) {
+    console.log("[avatar] mobile detected — 3D avatar disabled (no GLB / three.js download).");
+    return;
+  }
+
+  const [THREE, { GLTFLoader }] = await Promise.all([
+    import("three"),
+    import("three/addons/loaders/GLTFLoader.js"),
+  ]);
+  state.clock = new THREE.Clock();
+
   const w = elAvatar.clientWidth || 320;
   const h = elAvatar.clientHeight || 480;
 
