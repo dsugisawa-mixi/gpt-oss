@@ -71,6 +71,7 @@ const btnPrev = $("btn-prev");
 const btnSpeak = $("btn-speak");
 const btnNext = $("btn-next");
 const btnAsk = $("btn-ask");
+const btnPublish = $("btn-publish");
 const btnEnd = $("btn-end");
 const btnLogout = $("btn-logout");
 const inputQA = $("qa-input");
@@ -146,7 +147,7 @@ function setBusy(b) {
   // Speak is intentionally NOT disabled here — it's the play/pause toggle
   // and the user must always be able to press it to interrupt. 挙手 is
   // wired separately and likewise stays clickable mid-speech.
-  for (const el of [btnPrev, btnNext, btnAsk, btnEnd, inputQA]) el.disabled = b;
+  for (const el of [btnPrev, btnNext, btnAsk, btnPublish, btnEnd, inputQA]) el.disabled = b;
   if (!b) updateNav();
 }
 // Speak button doubles as a play/pause toggle. The icon mirrors whether
@@ -207,9 +208,9 @@ function updateNav() {
     }
   }
   // Ask は Lab 選択 (≥1) を要件にする。論文未適用でも質問可。
-  const hasLab = labState.selectedLabIds.size > 0;
-  btnAsk.disabled = !hasLab;
-  inputQA.disabled = !hasLab;
+  // updateAskAvailability() の facr_active ゲートと整合させるため、
+  // フラグ確認はそちらに委譲して同じ判定式を共有する。
+  updateAskAvailability();
   btnEnd.disabled = false;
 }
 
@@ -265,6 +266,7 @@ async function chat({
   claim = "",
   priorEvidence = null,
   roundIdx = 0,
+  publish = false,
 }) {
   const opId = operatorId ?? activeLabForStage(stage);
   // /api/chat reads user_id from the body (not the header), so we must
@@ -275,6 +277,11 @@ async function chat({
     throw new Error(`/api/chat aborted: no auth for lab op=${opId} lab=${labId || "?"}`);
   }
   const body = { user_id: uid, stage, message };
+  // Publish ("発言") path: server skips LLM/RAG/FACR/TTS and just appends
+  // the message to the per-Lab publish ring keyed by the X-User-Id-{LAB_ID}
+  // we already send. Returns a minimal ChatResponse with publish_id in
+  // accuracy. Caller is expected to ignore the empty reply.
+  if (publish) body.publish = true;
   if (slide) body.slide = slide;
   // Multi-Lab fan-out: same group_id sent to every Lab so the timeline
   // can re-mark ★ best across the group on reload (the in-memory badge
@@ -301,10 +308,17 @@ async function chat({
   if (!r.ok) {
     const err = await r.text();
     if (r.status === 423) {
-      // Server is mid-RAG-rebuild. Tag the error so callers can distinguish
-      // it from a true backend failure and route to a notify() banner.
-      const e = new Error(_extractRebuildMessage(err) || "RAGリビルド中です。完了後に再度お試しください。");
-      e.rebuilding = true;
+      // 423 covers two distinct server-side exclusion windows — RAG rebuild
+      // and FACR cross-examination in progress. The payload's flag picks
+      // which one so the GUI can banner the right message.
+      const parsed = _parse423Body(err);
+      const msg = parsed.detail
+        || (parsed.facr_active
+            ? "FACR 検証中です。完了後に再度お試しください。"
+            : "RAGリビルド中です。完了後に再度お試しください。");
+      const e = new Error(msg);
+      if (parsed.facr_active) e.facrActive = true;
+      else e.rebuilding = true;
       throw e;
     }
     throw new Error(`/api/chat ${r.status}: ${err}`);
@@ -312,15 +326,23 @@ async function chat({
   return r.json();
 }
 
-// Pull the human-readable detail out of a 423 response body. The server
-// sends {"detail": "...", "rebuilding": true} but bare strings (or HTML
-// from a misconfigured proxy) are also possible — fall back gracefully.
-function _extractRebuildMessage(body) {
+// Pull the flags + human-readable detail out of a 423 response body. The
+// server sends {"detail": "...", "rebuilding": true} or
+// {"detail": "...", "facr_active": true}; bare strings (or HTML from a
+// misconfigured proxy) are also possible — degrade to an empty parse so
+// the caller can fall back to a default message.
+function _parse423Body(body) {
   try {
     const j = JSON.parse(body);
-    if (j && typeof j.detail === "string") return j.detail;
+    if (j && typeof j === "object") {
+      return {
+        detail: typeof j.detail === "string" ? j.detail : "",
+        rebuilding: !!j.rebuilding,
+        facr_active: !!j.facr_active,
+      };
+    }
   } catch (_) { /* not JSON, fall through */ }
-  return "";
+  return { detail: "", rebuilding: false, facr_active: false };
 }
 
 // ---------- TTS ----------
@@ -986,6 +1008,12 @@ const labState = {
   // grayed-out so the user can see they exist without being able to
   // dispatch QA fan-outs that would just 401.
   authStatus: {},
+  // Set of operator_ids whose latest lab summary reported facr_active=true.
+  // Repopulated on every refreshLabs() tick. updateAskAvailability() blocks
+  // QA input as long as any *selected* Lab is in this set, so a parallel
+  // user can't fire questions into a server that's still busy with a peer
+  // tab's FACR cross-examination fan-out.
+  facrActive: new Set(),
 };
 
 // Promises so concurrent refreshLabs ticks don't double-fire signInWithLab
@@ -2155,13 +2183,16 @@ async function refreshLabs() {
     // chat()/heartbeat() can map opId → lab_id → uid.
     const newLabels = {};
     const newLabIdByOpId = {};
+    const newFacrActive = new Set();
     for (const op of ops) {
       const lab = op.lab || {};
       newLabels[op.id] = lab.name || lab.lab_id || op.name || op.id?.slice(0, 6) || "Lab";
       if (lab.lab_id) newLabIdByOpId[op.id] = lab.lab_id;
+      if (lab.facr_active) newFacrActive.add(op.id);
     }
     labState.labels = newLabels;
     labState.labIdByOpId = newLabIdByOpId;
+    labState.facrActive = newFacrActive;
 
     // Per-Lab Google sign-in: try every visible Lab once. The Lab list
     // is shown regardless of auth state, but a Lab the user couldn't
@@ -2260,6 +2291,18 @@ async function refreshLabs() {
         head.append(tag);
       }
 
+      // FACR-active badge. Surfaces the server's exclusion window (see
+      // _facr_active in your_professor_server.py) so a user on another
+      // tab sees why their Ask is locked. The actual input/Ask gating
+      // happens in updateAskAvailability() below; this is the visual.
+      if (lab.facr_active) {
+        row.classList.add("lab-facr-active");
+        const tag = document.createElement("span");
+        tag.className = "lab-facr-tag";
+        tag.textContent = "⚔️ FACR 検証中…";
+        head.append(tag);
+      }
+
       const summary = document.createElement("div");
       summary.className = "lab-summary";
       summary.textContent = lab.summary || "(準備中…)";
@@ -2337,8 +2380,30 @@ function toggleLab(id) {
 // 0 Lab に戻ったら逆に Ask を閉じる（fan-out 先がないため）。
 function updateAskAvailability() {
   const hasLab = labState.selectedLabIds.size > 0;
-  btnAsk.disabled = !hasLab;
-  inputQA.disabled = !hasLab;
+  // If any selected Lab has facr_active=true, the server will 423 every
+  // non-FACR /api/chat (see _facr_active in your_professor_server.py).
+  // Pre-empt that round-trip in the UI so the user gets immediate visual
+  // feedback ("FACR 検証中…") rather than a delayed error after Enter.
+  const facrBlocked = Array.from(labState.selectedLabIds)
+    .some((opId) => labState.facrActive.has(opId));
+  btnAsk.disabled = !hasLab || facrBlocked;
+  // 発言 (publish) は単一 Lab 限定。論文アップロード/技術メモと同じく
+  // 「送り先が一意に決まる」ことが前提なので 0 でも 2+ でも無効化。
+  // facrBlocked は server 側 publish 分岐が FACR 排他より前にあるため
+  // 動作上は不要だが、入力欄が facr で disabled になる挙動と揃える。
+  const labCount = labState.selectedLabIds.size;
+  btnPublish.disabled = labCount !== 1 || facrBlocked;
+  btnPublish.title = facrBlocked
+    ? "FACR 検証中… 完了までお待ちください"
+    : labCount === 0
+      ? "発言先の Lab を 1 つ選択してください"
+      : labCount > 1
+        ? "発言は 1 つの Lab にだけ送れます。Lab 選択を 1 つに絞ってください"
+        : "LLM/RAG なし。アクティブ Lab の発言タイムラインに追記";
+  inputQA.disabled = !hasLab || facrBlocked;
+  inputQA.placeholder = facrBlocked
+    ? "FACR 検証中… 完了までお待ちください"
+    : "質疑応答（質問を入力してEnter）";
 }
 
 // Tickets live on each Lab's local TICKETS_DIR, so eligibility is per-Lab:
@@ -2569,6 +2634,18 @@ async function fanOutQa(question, labs) {
       "リビルド完了後に再度お試しください。"
     );
   }
+  // Same surface for FACR cross-examination exclusion. Servers 423 with
+  // facr_active=true while another tab's FACR run is in flight.
+  const facrLabs = results
+    .map((r, i) => ({ r, opId: labs[i] }))
+    .filter(({ r }) => r.status === "rejected" && r.reason && r.reason.facrActive)
+    .map(({ opId }) => labState.labels[opId] || opId);
+  if (facrLabs.length) {
+    alert(
+      `FACR 検証中の Lab には質問できません: ${facrLabs.join(" / ")}\n` +
+      "FACR 完了後に再度お試しください。"
+    );
+  }
   setStatus(failed
     ? `asked ${ok}/${labs.length} labs (${failed} failed)`
     : `asked ${ok}/${labs.length} labs ✓`);
@@ -2639,6 +2716,38 @@ btnAsk.addEventListener("click", async () => {
 });
 
 
+// 発言 (publish) — append the message to the active Lab's publish ring
+// without invoking RAG/LLM/FACR/TTS. Single Lab only (the active QA
+// Lab); multi-Lab fan-out is reserved for Ask. The microcontroller
+// poll on /api/qa/timeline?publish=1 picks it up next cycle.
+btnPublish.addEventListener("click", async () => {
+  const q = inputQA.value.trim();
+  if (!q) return;
+  const opId = activeLabForStage("qa");
+  if (!opId) {
+    alert("発言先の Lab が選択されていません");
+    return;
+  }
+  const labLabel = labState.labels[opId] || opId.slice(0, 6);
+  btnPublish.disabled = true;
+  try {
+    const res = await chat({
+      stage: "qa",
+      message: q,
+      operatorId: opId,
+      publish: true,
+    });
+    inputQA.value = "";
+    const pid = (res && res.accuracy && res.accuracy.publish_id) || "?";
+    setStatus(`発言 → ${labLabel} (publish_id=${pid})`);
+  } catch (e) {
+    setStatus(`発言失敗: ${e.message || e}`);
+  } finally {
+    updateAskAvailability();
+  }
+});
+
+
 // Typing in the QA input cancels the auto chain so the audience has time
 // to compose without being talked over. If the 30-second hand-raise
 // silence timer is running, restart it on every keystroke so the user
@@ -2667,7 +2776,7 @@ btnEnd.addEventListener("click", async () => {
   cancelHandRaiseAutoResume();
   state.scriptResumeAt = null;
   await doStage("closing");
-  for (const b of [btnPrev, btnSpeak, btnNext, btnAsk, btnEnd]) b.disabled = true;
+  for (const b of [btnPrev, btnSpeak, btnNext, btnAsk, btnPublish, btnEnd]) b.disabled = true;
   inputQA.disabled = true;
   setStatus("closed");
 });

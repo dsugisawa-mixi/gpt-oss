@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0d1226">
 <title>D.Sugisawa LT</title>
@@ -17,6 +17,10 @@
     display: grid;
     grid-template-rows: auto 1fr auto;
     height: 100vh;
+    /* iOS Safari: the bottom toolbar dynamically lifts up over fixed-height
+       100vh layouts, hiding the footer's last row (Ask/Status/Logout on
+       mobile). 100dvh tracks the visible viewport as that bar appears. */
+    height: 100dvh;
   }
   header {
     padding: 14px 20px;
@@ -357,6 +361,23 @@
     0%, 100% { opacity: 1; }
     50%      { opacity: 0.55; }
   }
+  /* FACR cross-examination in progress on this Lab — same visual treatment
+     as the rebuild badge but red-tinted to distinguish the two exclusion
+     windows (rebuild = yellow, FACR = red). */
+  .lab-row .lab-facr-tag {
+    margin-left: 6px;
+    font-size: 0.78em; line-height: 1;
+    color: #fff;
+    background: #c73650;
+    border: 1px solid #7a1f2f;
+    padding: 2px 7px; border-radius: 10px;
+    font-weight: 700;
+    animation: lab-rebuild-pulse 1.4s ease-in-out infinite;
+  }
+  .lab-row.lab-facr-active {
+    border-color: #7a1f2f;
+    box-shadow: 0 0 0 1px rgba(199, 54, 80, 0.22);
+  }
   .user-row {
     display: flex; align-items: flex-start; gap: 8px;
     padding: 6px 4px;
@@ -567,6 +588,9 @@
 
   footer {
     padding: 12px 16px;
+    /* Respect iOS home-indicator safe area so the Ask/Status/Logout row
+       isn't clipped under the bottom inset on notched iPhones. */
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
     background: rgba(0,0,0,0.4);
     border-top: 1px solid rgba(255,255,255,0.06);
     display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
@@ -1018,6 +1042,7 @@
   <button id="btn-next" disabled>次 →</button>
   <input id="qa-input" placeholder="質疑応答（質問を入力してEnter）" disabled />
   <button id="btn-ask" disabled>Ask</button>
+  <button id="btn-publish" title="LLM/RAG なし。アクティブ Lab の発言タイムラインに追記" disabled>発言</button>
   <button id="btn-end" disabled>End</button>
   <button id="btn-upload" title="論文PDFをアップロードしてスライド生成" disabled>論文アップロード</button>
   <button id="btn-memo" title="技術メモ（テキスト）をRAGに追加" disabled>技術メモ追加</button>

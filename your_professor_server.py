@@ -33,6 +33,7 @@ import re
 import shutil
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -172,6 +173,15 @@ ALLOWED_EMAIL_DOMAIN = os.environ.get("ALLOWED_EMAIL_DOMAIN", "mixi.co.jp")
 CUSTOM_AUTH_FILE = Path(os.environ.get("CUSTOM_AUTH_FILE", ".custom-auth.txt"))
 custom_allowlist: set[str] = set()
 custom_roles: dict[str, set[str]] = {}
+
+# Per-device shared-secret registry for the microcontroller publish path
+# (POST /api/chat with publish=true and GET /api/qa/timeline?publish=1).
+# Each non-comment, non-blank line is `<device_id> [label...]`. The
+# device_id is the value of the X-Device-Id header; the optional label
+# is echoed back alongside each stored utterance so the GUI can show
+# which device spoke without exposing the raw id.
+DEVICES_FILE = Path(os.environ.get("DEVICES_FILE", ".devices.txt"))
+DEVICE_HEADER = "X-Device-Id"
 
 SYSTEM_PROMPT_TEMPLATE = """\
 # 役割
@@ -383,6 +393,18 @@ participants: dict[str, dict] = {}
 # server process. Reset on restart, by design.
 _qa_id_counter = 0
 
+# Microcontroller "発言" ring. Capped at PUBLISH_BUFFER_MAX entries with
+# FIFO eviction (collections.deque(maxlen=...) drops from the left as
+# new items append on the right). Lives in heap, separate from the
+# participants-keyed qa lists so publish entries never mix with Q/A.
+# _publish_lock serializes the (id-increment, append) pair so
+# concurrent POST /api/chat?publish=true requests can't observe the
+# same publish_id or interleave the assignment.
+PUBLISH_BUFFER_MAX = 1000
+_publish_id_counter = 0
+_publish_buffer: "deque[dict]" = deque(maxlen=PUBLISH_BUFFER_MAX)
+_publish_lock = asyncio.Lock()
+
 # Active presentation metadata — populated from the most recently uploaded
 # paper. `theme` is injected into the system prompt; `presenter` and
 # `venue` are echoed to the browser header. All cleared on restart.
@@ -443,6 +465,11 @@ class ChatRequest(BaseModel):
     claim: str = ""
     prior_evidence: list[str] = Field(default_factory=list)
     round_idx: int = 0
+    # Microcontroller "発言" path. When true, /api/chat skips Google-uid
+    # auth, RAG, FACR, LLM, persona and TTS; it just appends `message`
+    # to the per-Lab publish ring after validating X-Device-Id. Read
+    # back via GET /api/qa/timeline?publish=1.
+    publish: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -593,6 +620,27 @@ def _load_custom_auth() -> tuple[set[str], dict[str, set[str]]]:
     return emails, roles
 
 
+def _load_devices() -> dict[str, str]:
+    """Read DEVICES_FILE → {device_id: label}.
+
+    Same line format as CUSTOM_AUTH_FILE: `<device_id> [label...]`. The
+    device_id is matched byte-for-byte against the X-Device-Id header.
+    Missing file → {} (publish path then rejects every request)."""
+    out: dict[str, str] = {}
+    if not DEVICES_FILE.exists():
+        return out
+    try:
+        for line in DEVICES_FILE.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split(None, 1)
+            out[parts[0]] = parts[1].strip() if len(parts) == 2 else ""
+    except Exception:
+        logger.exception("failed to read %s", DEVICES_FILE)
+    return out
+
+
 def _is_allowed_email(email: str) -> bool:
     """True iff email's domain is ALLOWED_EMAIL_DOMAIN (or subdomain of it),
     OR the email is explicitly listed in CUSTOM_AUTH_FILE."""
@@ -674,6 +722,30 @@ def _record_qa(
     return entry
 
 
+async def _record_publish(*, user_id: str, label: str, message: str) -> dict:
+    """Append one publish entry to the FIFO ring.
+
+    `user_id` is the unified originator slot — it holds whichever of
+    X-Device-Id / X-User-Id-{LAB_ID} authenticated this request (the
+    two paths share the same field intentionally; consumers shouldn't
+    have to branch on auth source). Holds _publish_lock around the
+    (counter++, append) pair so concurrent publishers can't get the
+    same publish_id. The deque's maxlen handles eviction."""
+    global _publish_id_counter
+    async with _publish_lock:
+        _publish_id_counter += 1
+        entry = {
+            "publish_id": _publish_id_counter,
+            "user_id": user_id,
+            "label": label,
+            "message": message,
+            "ts": time.time(),
+            "lab_id": LAB_ID,
+        }
+        _publish_buffer.append(entry)
+    return entry
+
+
 def _all_qa_entries() -> list[dict]:
     """Flatten all participants' qa lists into one list."""
     out: list[dict] = []
@@ -716,6 +788,57 @@ def require_auth(request: Request) -> str:
     if uid not in _load_users():
         raise HTTPException(status_code=401, detail="unauthenticated")
     return uid
+
+
+def _request_device_id(request: Request) -> Optional[str]:
+    """Read the X-Device-Id header (case-insensitive)."""
+    v = request.headers.get(DEVICE_HEADER)
+    if v:
+        return v
+    return request.headers.get(DEVICE_HEADER.lower())
+
+
+def require_device(request: Request) -> tuple[str, str]:
+    """Auth gate for the publish path: validate X-Device-Id against the
+    DEVICES_FILE registry. Returns (device_id, label). 401 on missing
+    header or unknown id. Used by POST /api/chat?publish=true and
+    GET /api/qa/timeline?publish=1."""
+    did = _request_device_id(request)
+    if not did:
+        raise HTTPException(
+            status_code=401,
+            detail=f"missing {DEVICE_HEADER} header",
+        )
+    devs = _load_devices()
+    if did not in devs:
+        raise HTTPException(status_code=401, detail="unknown device")
+    return did, devs[did]
+
+
+def require_publisher(request: Request) -> tuple[str, str]:
+    """Auth gate for the publish path. Accepts EITHER X-Device-Id (for
+    microcontroller clients) OR the per-Lab X-User-Id-{LAB_ID} header
+    (for the browser GUI, which already has Google sign-in). Returns
+    (publisher_id, label). 401 only if neither header validates.
+
+    The two paths land in the same publish ring; the entry's id+label
+    fields hold whichever credential was used, so consumers (mic LCD,
+    GUI tail) see a uniform schema regardless of who posted."""
+    did = _request_device_id(request)
+    if did:
+        devs = _load_devices()
+        if did in devs:
+            return did, devs[did]
+    uid = _request_user_id(request)
+    if uid:
+        users = _load_users()
+        u = users.get(uid)
+        if u is not None:
+            return uid, (u.get("display_name") or "")
+    raise HTTPException(
+        status_code=401,
+        detail=f"missing or invalid {DEVICE_HEADER} / {LAB_USER_HEADER} header",
+    )
 
 
 def _user_roles(user_id: str) -> set[str]:
@@ -1006,6 +1129,22 @@ _rag_ready: bool = False
 # /api/lab/summary so the GUI can display the badge, and is read by the
 # gate_during_rebuild middleware to 423 the GPU-using endpoints.
 _rag_rebuilding: bool = False
+
+# FACR exclusion. The cross-examination run is browser-orchestrated and
+# fans out many /api/chat calls with action ∈ FACR_ACTIONS. Each call
+# refreshes this timestamp; non-FACR /api/chat is 423-gated while the
+# timestamp is fresh, so a parallel user QA on another tab can't time-slice
+# the LLM/embedder with an in-progress FACR fan-out. The timestamp-based
+# scheme self-expires after FACR_HOLD_SEC of silence — no explicit
+# begin/end signal required, so a browser crash mid-FACR can't permanently
+# wedge the gate.
+_facr_last_seen: float = 0.0   # time.monotonic() of last FACR-mode call
+FACR_HOLD_SEC: float = 20.0    # gap between rounds is seconds; 20s covers it
+FACR_ACTIONS = frozenset({"facr_baseline", "cross_examine"})
+
+
+def _facr_active() -> bool:
+    return (time.monotonic() - _facr_last_seen) < FACR_HOLD_SEC
 
 
 @app.on_event("startup")
@@ -1746,7 +1885,39 @@ def generate_reply(
 # =====================================================================
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
+    # Microcontroller "発言" short-circuit. No Google uid, no RAG/LLM/TTS
+    # — just validate the device header and append to the publish ring.
+    # Sits BEFORE every gate below (uid check, FACR exclusion, stage
+    # validation) because none of them apply to a fire-and-forget
+    # publish from an unattended device.
+    if req.publish:
+        # Devices are read-only on the publish path (they only poll the
+        # timeline back). The POST side accepts only Google-signed-in
+        # users — same gate as the rest of /api/chat. user_id comes
+        # from the body to match the existing chat() convention.
+        users = _load_users()
+        u = users.get(req.user_id)
+        if u is None:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "unauthenticated; sign in via /api/auth/google first"},
+            )
+        msg = (req.message or "").strip()
+        if not msg:
+            return JSONResponse(status_code=400, content={"detail": "empty message"})
+        label = u.get("display_name", "")
+        entry = await _record_publish(user_id=req.user_id, label=label, message=msg)
+        return ChatResponse(
+            user_id="",
+            reply="",
+            stage=req.stage,
+            slide_page=None,
+            voice=(req.voice or "male"),
+            lab_id=LAB_ID,
+            accuracy={"publish_id": entry["publish_id"], "ts": entry["ts"]},
+        )
+
     logger.info("chat: %s", req.model_dump())
 
     # Auth: only registered users (= signed in via Google with @mixi.co.jp
@@ -1763,6 +1934,30 @@ async def chat(req: ChatRequest):
         return JSONResponse(
             status_code=400,
             content={"detail": f"invalid stage: {req.stage!r}. expected one of {VALID_STAGES}"},
+        )
+
+    # FACR exclusion gate. FACR is browser-orchestrated, but each fan-out
+    # call lands here; we treat the *first* FACR-mode call as the start of
+    # the exclusion window and any subsequent call within FACR_HOLD_SEC as
+    # the run continuing. Non-FACR chat (a parallel tab's regular QA) is
+    # 423-locked for that window so vLLM/embedder time-slicing doesn't
+    # tank both flows. See `_facr_active` definition for the rationale.
+    global _facr_last_seen
+    if req.action in FACR_ACTIONS:
+        _facr_last_seen = time.monotonic()
+    elif _facr_active():
+        logger.info(
+            "chat: 423 (FACR in progress) user=%s action=%s age=%.1fs",
+            req.user_id, req.action,
+            time.monotonic() - _facr_last_seen,
+        )
+        return JSONResponse(
+            status_code=423,
+            content={
+                "detail": "FACR 検証中です。完了後に再度お試しください。",
+                "facr_active": True,
+            },
+            headers={"Retry-After": "10"},
         )
 
     # FACR baseline seeding. Pure retrieval against THIS Lab's corpus using
@@ -2098,6 +2293,10 @@ def _build_lab_summary_payload() -> dict:
         # GUI gates question/upload/tech-memo while True and shows a
         # "🔄 RAGリビルド中…" badge on the corresponding lab card.
         "rebuilding": _rag_rebuilding,
+        # True while a FACR cross-examination run is in flight (any tab,
+        # any user). The GUI disables QA input + Ask in that window so a
+        # parallel user QA doesn't time-slice the LLM with the FACR fan-out.
+        "facr_active": _facr_active(),
         # Per-day "what knowledge entered this corpus" bullets, newest-first,
         # last 7 days. Empty list if record_daily_additions.py has never run.
         "recent_additions": recent_additions,
@@ -2115,7 +2314,10 @@ async def get_lab_summary():
 
 
 @app.post("/api/tts/generate_stream")
-async def tts_generate_stream(req: Request, _uid: str = Depends(require_auth)):
+async def tts_generate_stream(
+    req: Request,
+    _pub: tuple[str, str] = Depends(require_publisher),
+):
     """Proxy raw-PCM streaming TTS from TTS_BACKEND to the browser.
 
     Body forwarded verbatim. Upstream X-Sample-Rate/Content-Type are passed
@@ -2296,10 +2498,11 @@ async def presence_users(_uid: str = Depends(require_auth)):
 
 @app.get("/api/qa/timeline")
 async def qa_timeline_get(
+    request: Request,
     start: int = 0,
     end: int = -1,
     limit: int = 10,
-    _uid: str = Depends(require_auth),
+    publish: int = 0,
 ):
     """Range query over QA entries by globally-unique qa_id.
 
@@ -2312,7 +2515,32 @@ async def qa_timeline_get(
     Typical client usage:
       first poll  : start=0      &end=-1&limit=10
       next polls  : start={lastSeenId}&end=-1&limit=10
-    """
+
+    publish=1 switches to the microcontroller publish ring instead of
+    the Q/A timeline. Range semantics are identical but operate on
+    publish_id, items come from the FIFO ring (capped at
+    PUBLISH_BUFFER_MAX), and auth is X-Device-Id rather than the
+    per-Lab Google uid header. The proxy-routing query operator_id
+    is silently ignored here (FastAPI accepts unknown query params)."""
+    if publish:
+        require_publisher(request)
+        async with _publish_lock:
+            buf = list(_publish_buffer)
+            max_id = _publish_id_counter
+        if end == -1:
+            items = [e for e in buf if e["publish_id"] > start]
+        else:
+            items = [e for e in buf if start < e["publish_id"] <= end]
+        items.sort(key=lambda e: e["publish_id"])
+        if limit and len(items) > limit:
+            items = items[:limit]
+        return {
+            "count": len(items),
+            "max_publish_id": max_id,
+            "items": items,
+        }
+
+    require_auth(request)
     items = _all_qa_entries()
     if end == -1:
         items = [e for e in items if e["qa_id"] > start]
