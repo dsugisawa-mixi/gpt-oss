@@ -722,7 +722,9 @@ def _record_qa(
     return entry
 
 
-async def _record_publish(*, user_id: str, label: str, message: str) -> dict:
+async def _record_publish(
+    *, user_id: str, label: str, message: str, voice: str = "",
+) -> dict:
     """Append one publish entry to the FIFO ring.
 
     `user_id` is the unified originator slot — it holds whichever of
@@ -739,6 +741,7 @@ async def _record_publish(*, user_id: str, label: str, message: str) -> dict:
             "user_id": user_id,
             "label": label,
             "message": message,
+            "voice": voice,
             "ts": time.time(),
             "lab_id": LAB_ID,
         }
@@ -1907,13 +1910,22 @@ async def chat(req: ChatRequest, request: Request):
         if not msg:
             return JSONResponse(status_code=400, content={"detail": "empty message"})
         label = u.get("display_name", "")
-        entry = await _record_publish(user_id=req.user_id, label=label, message=msg)
+        # Persona persisted on the ring entry so /api/qa/timeline?publish=1
+        # consumers (GUI tail, mic LCD) can render the speaker. Unknown
+        # values fall back to "male" — matches the default the rest of the
+        # server uses for TTS.
+        voice = (req.voice or "").strip().lower()
+        if voice not in ("male", "female"):
+            voice = "male"
+        entry = await _record_publish(
+            user_id=req.user_id, label=label, message=msg, voice=voice,
+        )
         return ChatResponse(
             user_id="",
             reply="",
             stage=req.stage,
             slide_page=None,
-            voice=(req.voice or "male"),
+            voice=voice,
             lab_id=LAB_ID,
             accuracy={"publish_id": entry["publish_id"], "ts": entry["ts"]},
         )
