@@ -1014,6 +1014,11 @@ const labState = {
   // user can't fire questions into a server that's still busy with a peer
   // tab's FACR cross-examination fan-out.
   facrActive: new Set(),
+  // operator_ids whose recent-additions <details> panel the user has
+  // expanded. refreshLabs() rebuilds the lab list DOM from scratch on
+  // every poll, so without this persistence the panel would collapse
+  // on the next tick while the user was still reading it.
+  additionsOpen: new Set(),
 };
 
 // Promises so concurrent refreshLabs ticks don't double-fire signInWithLab
@@ -2104,13 +2109,21 @@ function _arxivAbsHref(id) { return `https://arxiv.org/abs/${encodeURIComponent(
 //     ... newest first ...
 //   ]
 // Returns null when there's nothing to show — callers skip the append.
-function renderRecentAdditions(recent) {
+function renderRecentAdditions(recent, opId) {
   if (!Array.isArray(recent) || recent.length === 0) return null;
   const total = recent.reduce((s, d) => s + (d.added_count | 0), 0);
   if (total <= 0) return null;
 
   const wrap = document.createElement("details");
   wrap.className = "lab-additions";
+  // Restore the user's expand state across refreshLabs() rebuilds.
+  if (opId && labState.additionsOpen.has(opId)) wrap.open = true;
+  if (opId) {
+    wrap.addEventListener("toggle", () => {
+      if (wrap.open) labState.additionsOpen.add(opId);
+      else labState.additionsOpen.delete(opId);
+    });
+  }
   // Clicks/keystrokes inside the panel must not bubble up to the row's
   // toggleLab() handler — otherwise expanding the panel also toggles the
   // Lab's selection.
@@ -2220,6 +2233,9 @@ async function refreshLabs() {
     for (const opId of Object.keys(labState.authStatus)) {
       if (!ops.some((o) => o.id === opId)) delete labState.authStatus[opId];
     }
+    for (const opId of Array.from(labState.additionsOpen)) {
+      if (!ops.some((o) => o.id === opId)) labState.additionsOpen.delete(opId);
+    }
 
     if (!ops.length) {
       const empty = document.createElement("div");
@@ -2316,7 +2332,7 @@ async function refreshLabs() {
       // "What knowledge entered this corpus in the last 7 days" — collapsed
       // by default; expanding it must not toggle Lab selection, so stop the
       // bubbling click from reaching the row-level toggleLab() handler.
-      const additionsEl = renderRecentAdditions(lab.recent_additions);
+      const additionsEl = renderRecentAdditions(lab.recent_additions, op.id);
 
       row.append(head, summary, meta);
       if (additionsEl) row.append(additionsEl);
