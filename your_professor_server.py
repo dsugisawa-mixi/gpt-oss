@@ -1385,13 +1385,32 @@ def _build_cross_exam_messages(
     "support" factor in Δ = relevance · novelty · support — picking the
     wrong stance is what costs the contributing Lab credit.
     """
+    # Earlier rubric was strict-NLI ("entails / contradicts / else NEUTRAL").
+    # In production that produced ~94% NEUTRAL across 16 judgments because
+    # corpus chunks (paper abstracts, LaTeX, metadata) rarely formally entail
+    # a multi-sentence claim — they're consistent with it, but not a strict
+    # entailment. Result: Σ Δ collapsed to ~0 and FACR couldn't rank Labs.
+    # Lean toward labeling: SUPPORT covers "consistent with / favorable to",
+    # REBUT covers "inconsistent with / unfavorable to", NEUTRAL only when
+    # the chunk is genuinely off-topic or orthogonal to the claim's content.
     rubric = (
-        "You are an NLI-style classifier for a federated RAG system.\n"
+        "You are a stance labeler for a federated RAG cross-examination.\n"
         "For each candidate evidence chunk, label its stance toward the CLAIM:\n"
-        "  SUPPORT  — the chunk entails or directly corroborates the claim\n"
-        "  REBUT    — the chunk contradicts or directly refutes the claim\n"
-        "  NEUTRAL  — same topic but does not entail or refute (default)\n"
-        "Be strict. Topical overlap alone is NEUTRAL. If unsure, say NEUTRAL.\n"
+        "  SUPPORT  — the chunk presents information consistent with or\n"
+        "             favorable to the claim (mechanisms it cites, results\n"
+        "             it relies on, related findings that back it up). Does\n"
+        "             NOT need to be a formal entailment.\n"
+        "  REBUT    — the chunk presents information inconsistent with or\n"
+        "             unfavorable to the claim (counter-evidence, opposing\n"
+        "             mechanism, contradictory measurement, alternative\n"
+        "             explanation that would weaken the claim).\n"
+        "  NEUTRAL  — the chunk is off-topic, references-only, or genuinely\n"
+        "             orthogonal — its content gives no useful signal about\n"
+        "             whether the claim holds.\n"
+        "Prefer SUPPORT or REBUT when there is any directional signal. Use\n"
+        "NEUTRAL only when the chunk could not move a reader's belief in\n"
+        "either direction. A chunk that introduces the same paper/topic\n"
+        "and is consistent with the claim's framing counts as SUPPORT.\n"
         "Output ONLY a JSON array, one object per chunk in input order:\n"
         "[{\"i\": 0, \"stance\": \"SUPPORT|REBUT|NEUTRAL\"}, ...]\n"
         "No prose, no markdown fences."
@@ -1555,6 +1574,15 @@ def _facr_cross_examine(
         # NEUTRAL on this). Retry once with a larger budget so a single
         # over-thinking round doesn't permanently zero this Lab's Δ.
         parse_failed = ("[" not in (verdict or ""))
+        if parse_failed:
+            # Δ=0 in production was indistinguishable between "all NEUTRAL"
+            # and "parse failure" — surface the raw final-channel text so we
+            # can tell which one is collapsing the signal.
+            logger.warning(
+                "FACR: stance verdict had no '[' — defaulting all NEUTRAL. "
+                "raw final[:200]=%r truncated=%s",
+                (verdict or "")[:200], truncated,
+            )
         if parse_failed and truncated:
             logger.warning(
                 "FACR: stance LLM produced no final array at 2048 tok; "
@@ -1575,6 +1603,26 @@ def _facr_cross_examine(
         c = float(r) * float(n) * stance_val.get(s, 0.0)
         contribs.append(c)
         delta += c
+
+    # Surface why Δ landed where it did. When Σ Δ comes back 0, we need to
+    # tell apart the two collapse modes from the log:
+    #   (a) every stance NEUTRAL  → support factor is the killer
+    #   (b) novelty all ~0        → baseline seed pool ate everything
+    # The line is compact enough to grep but carries the full per-chunk
+    # vector so the diagnosis is one log line, not a re-run.
+    n_sup = sum(1 for s in stances if s == "SUPPORT")
+    n_reb = sum(1 for s in stances if s == "REBUT")
+    n_neu = sum(1 for s in stances if s == "NEUTRAL")
+    logger.info(
+        "FACR components: Δ=%+.4f stances=[S=%d R=%d N=%d] "
+        "rel=%s nov=%s sup=%s contribs=%s prior_n=%d",
+        delta, n_sup, n_reb, n_neu,
+        [round(float(x), 3) for x in relevance],
+        [round(float(x), 3) for x in novelty],
+        [stance_val.get(s, 0.0) for s in stances],
+        [round(float(x), 3) for x in contribs],
+        len(prior_evidence),
+    )
 
     evidence_out: list[dict] = []
     for h, r, n, s, c in zip(hits, relevance, novelty, stances, contribs):
