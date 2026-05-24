@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Radio Mix Talk</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;color:#e0e0e0;font-family:system-ui,sans-serif;
+     display:flex;flex-direction:column;align-items:center;justify-content:center;
+     min-height:100vh}
+h1{font-size:1.4rem;margin-bottom:1rem;color:#aaa}
+#station{font-size:.9rem;color:#888;margin-bottom:1.5rem;text-align:center}
+#mic-btn{width:120px;height:120px;border-radius:50%;border:none;cursor:pointer;
+         background:#333;color:#ccc;font-size:1.1rem;font-weight:bold;
+         transition:all .2s;outline:none;display:flex;align-items:center;
+         justify-content:center;flex-direction:column;gap:6px}
+#mic-btn.active{background:#c0392b;color:#fff;box-shadow:0 0 30px rgba(192,57,43,.5)}
+#mic-btn:hover{transform:scale(1.05)}
+#mic-btn svg{width:36px;height:36px;fill:currentColor}
+#status{margin-top:1rem;font-size:.8rem;color:#666}
+#level{width:200px;height:6px;background:#333;border-radius:3px;margin-top:.8rem;overflow:hidden}
+#level-bar{height:100%;width:0%;background:#27ae60;transition:width 50ms}
+.slider-wrap{margin-top:1.5rem;display:flex;flex-direction:column;align-items:center;gap:4px}
+.slider-wrap label{font-size:.8rem;color:#888}
+.slider-wrap input[type=range]{width:200px;accent-color:#e67e22}
+#gain-val{font-size:.75rem;color:#e67e22;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>Radio Mix Talk</h1>
+<div id="station">loading...</div>
+<button id="mic-btn">
+  <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2z"/></svg>
+  <span>MIC</span>
+</button>
+<div id="level"><div id="level-bar"></div></div>
+<div id="status">Click MIC to start</div>
+<div class="slider-wrap">
+  <label>Radio Volume</label>
+  <input type="range" id="radio-gain" min="0" max="100" value="100" step="1">
+  <span id="gain-val">1.00</span>
+</div>
+<script>
+const btn = document.getElementById('mic-btn');
+const statusEl = document.getElementById('status');
+const levelBar = document.getElementById('level-bar');
+const stationEl = document.getElementById('station');
+let active = false, ctx = null, stream = null, workletNode = null;
+
+// Fetch station info
+async function updateStation() {
+  try {
+    const r = await fetch('/api/lab/summary');
+    const d = await r.json();
+    const m = d.current_meta || {};
+    stationEl.textContent = m.now_playing ? ('Now playing: ' + m.now_playing) : 'No station';
+  } catch(e) { stationEl.textContent = ''; }
+}
+updateStation();
+setInterval(updateStation, 10000);
+
+// AudioWorklet: lightweight, sends small chunks (~100ms) to main thread
+const processorCode = `
+const TARGET_SR = 16000;
+class PcmSender extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buf = new Float32Array(1600);
+    this._pos = 0;
+    this._phase = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch || ch.length === 0) return true;
+    const srcRate = sampleRate;
+    if (srcRate === TARGET_SR) {
+      for (let i = 0; i < ch.length; i++) {
+        this._buf[this._pos++] = ch[i];
+        if (this._pos >= this._buf.length) this._flush();
+      }
+    } else {
+      const ratio = srcRate / TARGET_SR;
+      while (this._phase < ch.length) {
+        const idx = Math.floor(this._phase);
+        const frac = this._phase - idx;
+        const s0 = ch[idx];
+        const s1 = idx + 1 < ch.length ? ch[idx + 1] : s0;
+        this._buf[this._pos++] = s0 + (s1 - s0) * frac;
+        if (this._pos >= this._buf.length) this._flush();
+        this._phase += ratio;
+      }
+      this._phase -= ch.length;
+    }
+    return true;
+  }
+  _flush() {
+    const samples = new Int16Array(this._pos);
+    for (let i = 0; i < this._pos; i++) {
+      let s = Math.max(-1, Math.min(1, this._buf[i]));
+      samples[i] = s < 0 ? s * 32768 : s * 32767;
+    }
+    this.port.postMessage(samples.buffer, [samples.buffer]);
+    this._pos = 0;
+  }
+}
+registerProcessor('pcm-sender', PcmSender);
+`;
+
+const blob = new Blob([processorCode], {type: 'application/javascript'});
+const workletUrl = URL.createObjectURL(blob);
+
+// Main thread: batch small chunks into ~3s sends
+let pcmChunks = [];
+let pcmTotalBytes = 0;
+let sendTimer = null;
+const SEND_INTERVAL_MS = 3000;
+let sending = false;
+
+function scheduleSend() {
+  if (sendTimer) return;
+  sendTimer = setTimeout(flushToServer, SEND_INTERVAL_MS);
+}
+
+async function flushToServer() {
+  sendTimer = null;
+  if (pcmTotalBytes === 0 || sending) {
+    if (pcmTotalBytes > 0) scheduleSend();
+    return;
+  }
+  // merge chunks
+  const merged = new Uint8Array(pcmTotalBytes);
+  let off = 0;
+  for (const c of pcmChunks) {
+    merged.set(new Uint8Array(c), off);
+    off += c.byteLength;
+  }
+  pcmChunks = [];
+  pcmTotalBytes = 0;
+  // base64 encode
+  let bin = '';
+  const chunk = 8192;
+  for (let i = 0; i < merged.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, merged.subarray(i, i + chunk));
+  }
+  const b64 = btoa(bin);
+  sending = true;
+  try {
+    await fetch('/local/audio', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({audio: b64})
+    });
+  } catch(e) {}
+  sending = false;
+}
+
+async function startMic() {
+  try {
+    ctx = new AudioContext();
+    await ctx.audioWorklet.addModule(workletUrl);
+    stream = await navigator.mediaDevices.getUserMedia({audio: {
+      channelCount: 1, echoCancellation: true,
+      noiseSuppression: false, autoGainControl: true
+    }});
+    const src = ctx.createMediaStreamSource(stream);
+    workletNode = new AudioWorkletNode(ctx, 'pcm-sender');
+    statusEl.textContent = 'Mic @ ' + ctx.sampleRate + 'Hz -> 16kHz';
+    workletNode.port.onmessage = (e) => {
+      const buf = e.data;  // ArrayBuffer of Int16
+      // level meter
+      const view = new DataView(buf);
+      let peak = 0;
+      for (let i = 0; i < view.byteLength; i += 2) {
+        const v = Math.abs(view.getInt16(i, true));
+        if (v > peak) peak = v;
+      }
+      levelBar.style.width = Math.min(100, (peak / 32768) * 100) + '%';
+      // accumulate for batched send
+      pcmChunks.push(buf);
+      pcmTotalBytes += buf.byteLength;
+      scheduleSend();
+    };
+    src.connect(workletNode);
+    workletNode.connect(ctx.destination);
+    active = true;
+    btn.classList.add('active');
+    btn.querySelector('span').textContent = 'ON AIR';
+    fetch('/local/mic', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({active: true})}).catch(()=>{});
+  } catch(e) {
+    statusEl.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function stopMic() {
+  // flush remaining audio and wait for it to arrive at server
+  if (sendTimer) { clearTimeout(sendTimer); sendTimer = null; }
+  await flushToServer();
+  // now tell server mic session ended
+  await fetch('/local/mic', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({active: false})}).catch(()=>{});
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (workletNode) { workletNode.disconnect(); workletNode = null; }
+  if (ctx) { ctx.close(); ctx = null; }
+  active = false;
+  btn.classList.remove('active');
+  btn.querySelector('span').textContent = 'MIC';
+  statusEl.textContent = 'Click MIC to start';
+  levelBar.style.width = '0%';
+}
+
+btn.addEventListener('click', () => { active ? stopMic() : startMic(); });
+
+// Radio gain slider
+const slider = document.getElementById('radio-gain');
+const gainVal = document.getElementById('gain-val');
+fetch('/local/radio_gain').then(r=>r.json()).then(d=>{
+  const v = Math.round(d.radio_gain * 100);
+  slider.value = v;
+  gainVal.textContent = d.radio_gain.toFixed(2);
+}).catch(()=>{});
+let gainTimer = null;
+slider.addEventListener('input', () => {
+  const g = (parseInt(slider.value) / 100).toFixed(2);
+  gainVal.textContent = g;
+  clearTimeout(gainTimer);
+  gainTimer = setTimeout(() => {
+    fetch('/local/radio_gain', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({gain: parseFloat(g)})
+    }).catch(()=>{});
+  }, 100);
+});
+</script>
+</body>
+</html>
