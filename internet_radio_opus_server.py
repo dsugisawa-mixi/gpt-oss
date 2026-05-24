@@ -189,19 +189,39 @@ def _transcode_one_station(station: dict, stop_event: threading.Event):
     ice.update_stream_title = _on_title
 
     try:
-        encoder = opuslib.Encoder(OPUS_SR, OPUS_CHANNELS, opuslib.APPLICATION_VOIP)
-        # opuslib の encoder.bitrate setter は opus_encoder_ctl (variadic) を
-        # argtypes 未設定で呼ぶため、ARM64 macOS では bitrate 値がレジスタ→
+        encoder = opuslib.Encoder(OPUS_SR, OPUS_CHANNELS, opuslib.APPLICATION_AUDIO)
+        # opuslib の encoder.* setter は opus_encoder_ctl (variadic) を
+        # argtypes 未設定で呼ぶため、ARM64 macOS では値がレジスタ→
         # スタックの ABI 不一致で libopus に届かない。ctypes を直接使い
         # fixed args の argtypes を宣言して variadic 引数を正しく渡す。
         _ctl = ctypes.cdll.LoadLibrary(opuslib.api.libopus._name).opus_encoder_ctl
         _ctl.restype = ctypes.c_int
         _ctl.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        # SET_BITRATE (4002)
         _rc = _ctl(encoder.encoder_state, 4002, ctypes.c_int32(OPUS_BITRATE))
         if _rc != 0:
             logger.warning("opus_encoder_ctl SET_BITRATE failed: %d", _rc)
         else:
             logger.info("Opus encoder bitrate set to %d bps (via direct CTL)", OPUS_BITRATE)
+        # SET_SIGNAL (4024) = SIGNAL_AUTO (-1000)
+        _rc = _ctl(encoder.encoder_state, 4024, ctypes.c_int32(-1000))
+        if _rc != 0:
+            logger.warning("opus_encoder_ctl SET_SIGNAL failed: %d", _rc)
+        else:
+            logger.info("Opus encoder signal set to SIGNAL_AUTO (via direct CTL)")
+        # SET_COMPLEXITY (4010) = 10 (最高品質)
+        _rc = _ctl(encoder.encoder_state, 4010, ctypes.c_int32(10))
+        if _rc != 0:
+            logger.warning("opus_encoder_ctl SET_COMPLEXITY failed: %d", _rc)
+        # SET_VBR (4006) = 1 (有効)
+        _rc = _ctl(encoder.encoder_state, 4006, ctypes.c_int32(1))
+        if _rc != 0:
+            logger.warning("opus_encoder_ctl SET_VBR failed: %d", _rc)
+        # SET_VBR_CONSTRAINT (4020) = 0 (unconstrained)
+        _rc = _ctl(encoder.encoder_state, 4020, ctypes.c_int32(0))
+        if _rc != 0:
+            logger.warning("opus_encoder_ctl SET_VBR_CONSTRAINT failed: %d", _rc)
+        logger.info("Opus encoder: complexity=10, VBR=1, VBR_CONSTRAINT=0")
 
         pcm_gen = miniaudio.stream_any(
             ice,
