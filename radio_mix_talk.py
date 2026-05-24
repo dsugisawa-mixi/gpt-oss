@@ -100,6 +100,7 @@ _clients_lock = threading.Lock()
 _current_station: dict = {}               # currently playing station info
 _next_switch_at: float = 0.0              # time.time() of next station switch
 _stations_list: list[dict] = []           # full JP station list
+_switch_event: threading.Event | None = None  # set to trigger station change
 
 
 # Local mic audio buffer (PCM s16le mono 16kHz) for mixing into broadcast
@@ -110,7 +111,7 @@ LOCAL_MIC_GAIN = float(os.environ.get("LOCAL_MIC_GAIN", "1.0"))
 RADIO_GAIN = float(os.environ.get("RADIO_GAIN", "0.1"))
 
 # Source radio volume (applied to radio PCM before encode, independent of mix)
-_radio_source_gain: float = 1.0
+_radio_source_gain: float = 0.36
 
 # When True, mixer always applies RADIO_GAIN even if local buf is empty
 _mic_active: bool = False
@@ -284,7 +285,7 @@ def _transcode_one_station(station: dict, stop_event: threading.Event):
         bytes_per_frame = OPUS_FRAME_SAMPLES * OPUS_CHANNELS * 2
 
         for pcm_chunk in pcm_gen:
-            if stop_event.is_set():
+            if stop_event.is_set() or (_switch_event and _switch_event.is_set()):
                 break
 
             pcm_buf.extend(pcm_chunk.tobytes())
@@ -342,13 +343,32 @@ def _station_loop(stop_event: threading.Event):
             stop_event.wait(30)
             continue
 
-        # Play the first station forever (reconnect on error)
-        station = _stations_list[0]
+        # Filter: codecs that miniaudio can decode
+        _supported = {"MP3", "FLAC", "WAV"}
+        compatible = [s for s in _stations_list
+                      if (s.get("codec") or "").strip().upper() in _supported]
+        if not compatible:
+            compatible = _stations_list[:1]
+        logger.info("Filtered %d playable stations (%s) out of %d total",
+                     len(compatible), "/".join(_supported), len(_stations_list))
+
+        # Cycle: 0, 1, 2, ... last -> 0, 1, 2, ... (1 min each)
+        idx = 0
         while not stop_event.is_set():
+            global _switch_event
+            _switch_event = threading.Event()
+            station = compatible[idx % len(compatible)]
+            logger.info("Now playing [%d/%d]: %s (codec=%s, bitrate=%s)",
+                        idx % len(compatible) + 1, len(compatible),
+                        station["name"], station.get("codec"), station.get("bitrate"))
+            timer = threading.Timer(60, _switch_event.set)
+            timer.daemon = True
+            timer.start()
             _transcode_one_station(station, stop_event)
+            timer.cancel()
+            _switch_event = None
             if not stop_event.is_set():
-                logger.info("Stream ended for %s, reconnecting in 2s...",
-                            station["name"])
+                idx += 1
                 stop_event.wait(2)
 
 
