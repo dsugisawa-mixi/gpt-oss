@@ -201,6 +201,8 @@ def _fetch_stations_sync() -> list[dict]:
             continue
         if s.get("hls") == 1 or ".m3u8" in stream_url:
             continue
+        if s.get("lastcheckok") != 1:
+            continue
         stations.append({
             "stationuuid": s.get("stationuuid"),
             "name": (s.get("name") or "").strip(),
