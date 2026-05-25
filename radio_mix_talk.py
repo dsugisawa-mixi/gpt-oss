@@ -101,6 +101,7 @@ _current_station: dict = {}               # currently playing station info
 _next_switch_at: float = 0.0              # time.time() of next station switch
 _stations_list: list[dict] = []           # full JP station list
 _switch_event: threading.Event | None = None  # set to trigger station change
+_current_ice = None  # current IceCastClient for forced close on switch
 
 
 # Local mic audio buffer (PCM s16le mono 16kHz) for mixing into broadcast
@@ -225,6 +226,7 @@ def _transcode_one_station(station: dict, stop_event: threading.Event):
     logger.info(">> Now playing: %s  (%s)  url=%s",
                 station["name"], station.get("codec"), url)
 
+    global _current_ice
     ice = None
     try:
         ice = miniaudio.IceCastClient(url)
@@ -232,6 +234,7 @@ def _transcode_one_station(station: dict, stop_event: threading.Event):
         logger.warning("Failed to connect to %s (%s), skipping",
                        station["name"], url)
         return
+    _current_ice = ice
 
     def _on_title(_client, title):
         logger.info("Stream title [%s]: %s", station["name"], title)
@@ -316,6 +319,7 @@ def _transcode_one_station(station: dict, stop_event: threading.Event):
         if not stop_event.is_set():
             logger.exception("Transcode error for %s", station["name"])
     finally:
+        _current_ice = None
         if ice:
             try:
                 ice.close()
@@ -361,11 +365,20 @@ def _station_loop(stop_event: threading.Event):
             logger.info("Now playing [%d/%d]: %s (codec=%s, bitrate=%s)",
                         idx % len(compatible) + 1, len(compatible),
                         station["name"], station.get("codec"), station.get("bitrate"))
-            timer = threading.Timer(60, _switch_event.set)
-            timer.daemon = True
-            timer.start()
-            _transcode_one_station(station, stop_event)
-            timer.cancel()
+            # Run transcode in a sub-thread so we can hard-kill on timeout
+            t = threading.Thread(target=_transcode_one_station,
+                                 args=(station, stop_event), daemon=True)
+            t.start()
+            t.join(timeout=60)
+            if t.is_alive():
+                logger.info("Station timeout, forcing switch from %s", station["name"])
+                _switch_event.set()
+                if _current_ice:
+                    try:
+                        _current_ice.close()
+                    except Exception:
+                        pass
+                t.join(timeout=5)
             _switch_event = None
             if not stop_event.is_set():
                 idx += 1
