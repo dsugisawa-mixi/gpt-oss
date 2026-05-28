@@ -101,7 +101,6 @@ _current_station: dict = {}               # currently playing station info
 _next_switch_at: float = 0.0              # time.time() of next station switch
 _stations_list: list[dict] = []           # full JP station list
 _switch_event: threading.Event | None = None  # set to trigger station change
-_current_ice = None  # current IceCastClient for forced close on switch
 
 
 # Local mic audio buffer (PCM s16le mono 16kHz) for mixing into broadcast
@@ -218,8 +217,11 @@ def _fetch_stations_sync() -> list[dict]:
     return stations
 
 
-def _transcode_one_station(station: dict, stop_event: threading.Event):
-    """Connect to one station, transcode to Opus, broadcast until stopped."""
+def _transcode_one_station(station: dict, stop_event: threading.Event,
+                           ice_holder: list | None = None):
+    """Connect to one station, transcode to Opus, broadcast until stopped.
+    If ice_holder is provided (a 1-element list), the IceCastClient is stored
+    there so the caller can force-close it from another thread."""
     global _current_station
 
     url = station["url"]
@@ -228,7 +230,6 @@ def _transcode_one_station(station: dict, stop_event: threading.Event):
     logger.info(">> Now playing: %s  (%s)  url=%s",
                 station["name"], station.get("codec"), url)
 
-    global _current_ice
     ice = None
     try:
         ice = miniaudio.IceCastClient(url)
@@ -236,7 +237,8 @@ def _transcode_one_station(station: dict, stop_event: threading.Event):
         logger.warning("Failed to connect to %s (%s), skipping",
                        station["name"], url)
         return
-    _current_ice = ice
+    if ice_holder is not None:
+        ice_holder.append(ice)
 
     def _on_title(_client, title):
         logger.info("Stream title [%s]: %s", station["name"], title)
@@ -321,7 +323,6 @@ def _transcode_one_station(station: dict, stop_event: threading.Event):
         if not stop_event.is_set():
             logger.exception("Transcode error for %s", station["name"])
     finally:
-        _current_ice = None
         if ice:
             try:
                 ice.close()
@@ -358,32 +359,89 @@ def _station_loop(stop_event: threading.Event):
         logger.info("Filtered %d playable stations (%s) out of %d total",
                      len(compatible), "/".join(_supported), len(_stations_list))
 
-        # Cycle: 0, 1, 2, ... last -> 0, 1, 2, ... (1 min each)
+        # Probe stations in background, play as soon as each passes
+        alive: list[dict] = []
+        alive_lock = threading.Lock()
+        probe_done = threading.Event()
+
+        def _probe_all():
+            for s in compatible:
+                if stop_event.is_set():
+                    break
+                url = s["url"]
+                try:
+                    with httpx.Client(timeout=httpx.Timeout(5, read=5)) as c:
+                        with c.stream("GET", url,
+                                      headers={"User-Agent": "radio-opus-server/1.0",
+                                               "Icy-MetaData": "0"},
+                                      follow_redirects=True) as r:
+                            if r.status_code >= 400:
+                                raise Exception(f"HTTP {r.status_code}")
+                            chunk = next(r.iter_bytes(1024), None)
+                            if not chunk or len(chunk) == 0:
+                                raise Exception("no payload")
+                    with alive_lock:
+                        alive.append(s)
+                    logger.info("Probe OK [%d]: %s", len(alive), s["name"])
+                except Exception as e:
+                    logger.info("Probe failed (%s), skipping: %s", e, s["name"])
+            probe_done.set()
+            logger.info("Probe complete: %d alive out of %d",
+                         len(alive), len(compatible))
+
+        probe_thread = threading.Thread(target=_probe_all, daemon=True)
+        probe_thread.start()
+
+        # Cycle: play alive stations as they become available
         idx = 0
         while not stop_event.is_set():
-            global _switch_event
-            _switch_event = threading.Event()
-            station = compatible[idx % len(compatible)]
-            logger.info("Now playing [%d/%d]: %s (codec=%s, bitrate=%s)",
-                        idx % len(compatible) + 1, len(compatible),
-                        station["name"], station.get("codec"), station.get("bitrate"))
-            # Run transcode in a sub-thread so we can hard-kill on timeout
-            t = threading.Thread(target=_transcode_one_station,
-                                 args=(station, stop_event), daemon=True)
-            t.start()
-            t.join(timeout=60)
-            if t.is_alive():
-                logger.info("Station timeout, forcing switch from %s", station["name"])
-                _switch_event.set()
-                if _current_ice:
-                    try:
-                        _current_ice.close()
-                    except Exception:
-                        pass
-                t.join(timeout=5)
-            _switch_event = None
-            if not stop_event.is_set():
-                idx += 1
+            try:
+                # Wait for at least one alive station
+                while not stop_event.is_set():
+                    with alive_lock:
+                        count = len(alive)
+                    if count > 0:
+                        break
+                    if probe_done.is_set():
+                        break
+                    stop_event.wait(0.5)
+
+                with alive_lock:
+                    if not alive:
+                        logger.warning("No alive stations after probe")
+                        break
+                    station = alive[idx % len(alive)]
+                    total = len(alive)
+
+                global _switch_event
+                _switch_event = threading.Event()
+                ice_holder: list = []
+                logger.info("Now playing [%d/%d]: %s (codec=%s, bitrate=%s)",
+                            idx % total + 1, total,
+                            station["name"], station.get("codec"), station.get("bitrate"))
+                t = threading.Thread(target=_transcode_one_station,
+                                     args=(station, stop_event, ice_holder), daemon=True)
+                t.start()
+                t.join(timeout=60)
+                if t.is_alive():
+                    logger.info("Station timeout, forcing switch from %s",
+                                station["name"])
+                    _switch_event.set()
+                    if ice_holder:
+                        try:
+                            ice_holder[0].close()
+                        except Exception:
+                            pass
+                    t.join(timeout=5)
+                    if t.is_alive():
+                        logger.warning("Zombie thread for %s, proceeding anyway",
+                                       station["name"])
+                _switch_event = None
+                if not stop_event.is_set():
+                    idx += 1
+                    stop_event.wait(2)
+            except Exception:
+                logger.exception("Station cycle error, continuing")
                 stop_event.wait(2)
 
 
