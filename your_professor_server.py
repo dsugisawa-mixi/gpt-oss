@@ -1516,21 +1516,55 @@ def _sigmoid(x: float) -> float:
     return z / (1.0 + z)
 
 
+def _build_facr_retrieval_query(
+    claim: str, prior_evidence: list[str]
+) -> str:
+    """D5: adversarial query steering.
+
+    Augment the peer's claim with snippets from prior cross-examination
+    rounds so the retriever explores new corpus regions rather than
+    returning identical chunks.  Without this, deterministic retrieval
+    produces Δ(k≥2) ≈ 0 and the "evidence gradient" collapses to a
+    single-round score.
+    """
+    if not prior_evidence:
+        return claim
+    # Take the tail of the evidence pool (most recent round's output).
+    # Cap per-snippet and total length to keep the embedding in its
+    # effective range — excessively long queries dilute cosine relevance.
+    _MAX_STEERING_SNIPPETS = 3
+    _MAX_SNIPPET_CHARS = 150
+    _MAX_TOTAL_CHARS = 800
+
+    recent = prior_evidence[-_MAX_STEERING_SNIPPETS:]
+    snippets = []
+    for s in recent:
+        t = (s or "").strip()
+        if t:
+            snippets.append(t[:_MAX_SNIPPET_CHARS])
+    if not snippets:
+        return claim
+    augmented = claim + " " + " ".join(snippets)
+    if len(augmented) > _MAX_TOTAL_CHARS:
+        augmented = augmented[:_MAX_TOTAL_CHARS]
+    return augmented
+
+
 def _facr_cross_examine(
     question: str, claim: str, prior_evidence: list[str], top_k: int = 4
 ) -> dict:
     """Run one round of FACR cross-examination on this Lab's corpus.
 
     Pipeline:
-      1. retrieve_knowledge(claim, top_k) — re-search OUR corpus for the
-         peer's claim (intentionally querying with the claim, not the
-         original question, so we hit the part of our corpus that talks
-         about the same proposition the peer is asserting).
-      2. relevance = sigmoid(reranker raw logit). Already 0..1.
-      3. novelty   = 1 − max cos(chunk, prior). Chunks redundant with
+      1. _build_facr_retrieval_query(claim, prior_evidence) — augment the
+         peer's claim with prior rebuttal snippets (D5: adversarial query
+         steering) so subsequent rounds explore different corpus regions.
+      2. retrieve_knowledge(augmented_query, top_k) — re-search OUR corpus.
+      3. relevance = sigmoid(reranker raw logit). Already 0..1.
+      4. novelty   = 1 − max cos(chunk, prior). Chunks redundant with
          existing evidence contribute zero.
-      4. support   = +1 / 0 / −1 from the LLM stance classifier.
-      5. Δ         = Σ_e relevance(e) · novelty(e) · support(e)
+      5. support   = +1 / 0 / −1 from the LLM stance classifier.
+      6. Δ         = Σ_e relevance(e) · novelty(e) · support(e)
 
     Returns a dict the orchestrator persists per (Lab, round). The LLM
     classifier is the only synchronous LLM call; vectorization + retrieval
@@ -1544,7 +1578,8 @@ def _facr_cross_examine(
             "stances": [],
             "note": "rag_unavailable",
         }
-    hits = retrieve_knowledge(claim, top_k=top_k)
+    query = _build_facr_retrieval_query(claim, prior_evidence)
+    hits = retrieve_knowledge(query, top_k=top_k)
     if not hits:
         return {
             "delta": 0.0,

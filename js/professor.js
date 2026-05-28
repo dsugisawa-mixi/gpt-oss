@@ -2187,7 +2187,10 @@ async function refreshLabs() {
     const r = await fetch("/api/tunnel/info");
     if (!r.ok) return;
     const data = await r.json();
-    const ops = Array.isArray(data.operators) ? data.operators : [];
+    // Only gameserver operators belong in the Lab list / auth / FACR flow.
+    // role=internetradio is a separate feature and must not appear here.
+    const ops = (Array.isArray(data.operators) ? data.operators : [])
+      .filter((o) => o.role === "gameserver");
     elLabsCount.textContent = ops.length;
     elLabsList.innerHTML = "";
 
