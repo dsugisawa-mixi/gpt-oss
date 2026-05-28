@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Fetch newly submitted arXiv cs.* papers matching given keywords, then
-download PDF + metadata into rag_inbox/arxiv/ for build_paper_index.py.
+Fetch newly submitted arXiv cs.* papers via the per-category Atom feeds,
+then download PDF + metadata into rag_inbox/arxiv/ for build_paper_index.py.
+
+Why RSS, not the API?
+---------------------
+The arXiv /api/query endpoint rate-limits our shared NAT IP aggressively
+(429 even on simple `cat:cs.NI` queries after a few hits). The Atom feeds
+at https://rss.arxiv.org/atom/<category> are server-cached, refresh once
+per day, and are the documented mechanism for daily polling.
+
+Filtering is therefore entirely client-side:
+- keyword: substring match against title + summary (case-insensitive)
+- date:    `published` compared against --date-from / --date-to / --recent-days
 
 Differential: papers already recorded in seen.json are skipped, so this
 script is safe to run every morning (intended cadence: JST 04:00 via cron).
@@ -9,9 +20,9 @@ script is safe to run every morning (intended cadence: JST 04:00 via cron).
 Usage
 -----
     python fetch_arxiv_cs.py \\
-        --keywords "retrieval augmented generation" "tool use" \\
-        --cs-category cs.CL \\
-        --max-results 30 \\
+        --cs-categories cs.NI cs.DC cs.CR cs.SE \\
+        --keywords "QUIC" "WebRTC" "HTTP/3" \\
+        --recent-days 3 \\
         --user-agent "monst-rag-bot/0.1 daisuke.sugisawa.ts@mixi.co.jp"
 
 Output layout
@@ -23,27 +34,29 @@ Output layout
 """
 import argparse
 import json
-import os
 import re
 import time
-import urllib.parse
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 
 import requests
 
-ARXIV_API = "https://export.arxiv.org/api/query"
+ARXIV_RSS_BASE = "https://rss.arxiv.org/atom/"
 
 NS = {
     "atom": "http://www.w3.org/2005/Atom",
     "arxiv": "http://arxiv.org/schemas/atom",
+    "dc": "http://purl.org/dc/elements/1.1/",
 }
 
 def safe_id(arxiv_id: str) -> str:
     return arxiv_id.replace("/", "_").replace(":", "_")
 
 def extract_arxiv_id(abs_url: str) -> str:
+    # arxiv RSS sometimes uses "oai:arXiv.org:2605.12345v1"
+    if abs_url.startswith("oai:arXiv.org:"):
+        return abs_url.split(":", 2)[-1]
     return abs_url.rstrip("/").split("/")[-1]
 
 def is_cs_paper(entry) -> bool:
@@ -53,15 +66,17 @@ def is_cs_paper(entry) -> bool:
     ]
     return any(c.startswith("cs.") for c in cats)
 
-def build_query(keywords, cs_category=None):
-    # (all:k1 OR all:k2 OR ...) AND cat:<cs.*|specific>
-    kw = " OR ".join([f'all:"{k}"' for k in keywords])
-    q = f"({kw})"
-    if cs_category:
-        q += f" AND cat:{cs_category}"
-    else:
-        q += " AND cat:cs.*"
-    return q
+def parse_date_arg(s):
+    """YYYY-MM-DD or YYYYMMDD → date object."""
+    s = s.replace("-", "")
+    return datetime.strptime(s[:8], "%Y%m%d").replace(tzinfo=timezone.utc)
+
+
+def matches_keywords(title, summary, keywords):
+    if not keywords:
+        return True
+    hay = (title + " " + summary).lower()
+    return any(k.lower() in hay for k in keywords)
 
 def load_seen(path: Path):
     if path.exists():
@@ -82,26 +97,40 @@ def download(url, out_path: Path, user_agent: str):
                     f.write(chunk)
         tmp.rename(out_path)
 
-def fetch_page(query, start, page_size, user_agent):
-    params = {
-        "search_query": query,
-        "start": start,
-        "max_results": page_size,
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
-    }
-    r = requests.get(
-        ARXIV_API,
-        params=params,
-        headers={"User-Agent": user_agent},
-        timeout=60,
-    )
-    r.raise_for_status()
-    return ET.fromstring(r.text).findall("atom:entry", NS)
+
+def fetch_feed(category, user_agent, max_retries=3):
+    url = ARXIV_RSS_BASE + category
+    backoff = 10
+    for attempt in range(max_retries + 1):
+        r = requests.get(
+            url,
+            headers={"User-Agent": user_agent},
+            timeout=60,
+        )
+        if r.status_code == 429:
+            if attempt == max_retries:
+                r.raise_for_status()
+            wait = int(r.headers.get("Retry-After", backoff))
+            print(f"  429 on {category}, waiting {wait}s (attempt {attempt+1}/{max_retries})",
+                  flush=True)
+            time.sleep(wait)
+            backoff = min(backoff * 2, 120)
+            continue
+        r.raise_for_status()
+        return ET.fromstring(r.text).findall("atom:entry", NS)
+    return []
 
 
-def process_entry(entry, seen, pdf_dir, meta_dir, user_agent):
-    """Returns base_id if newly downloaded, None if skipped."""
+_TOO_OLD = "__too_old__"
+_TOO_NEW = "__too_new__"
+_NO_KEYWORD = "__no_keyword__"
+
+
+def process_entry(entry, seen, pdf_dir, meta_dir, user_agent,
+                  date_from=None, date_to=None, keywords=None):
+    """Returns base_id if newly downloaded, _TOO_OLD/_TOO_NEW for date
+    out-of-range, _NO_KEYWORD if keyword filter rejects, None if skipped
+    for other reasons."""
     if not is_cs_paper(entry):
         return None
 
@@ -109,24 +138,53 @@ def process_entry(entry, seen, pdf_dir, meta_dir, user_agent):
     arxiv_id = extract_arxiv_id(abs_url)
     base_id = re.sub(r"v\d+$", "", arxiv_id)
 
+    published = entry.findtext("atom:published", "", NS)
+    updated = entry.findtext("atom:updated", "", NS)
+
+    # RSS feeds may omit <published>; fall back to <updated>.
+    date_str = published or updated
+    if date_str and (date_from or date_to):
+        pub_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        if date_to and pub_dt > date_to:
+            return _TOO_NEW
+        if date_from and pub_dt < date_from:
+            return _TOO_OLD
+
     if base_id in seen:
         return None
 
     title = " ".join(entry.findtext("atom:title", "", NS).split())
     summary = " ".join(entry.findtext("atom:summary", "", NS).split())
-    published = entry.findtext("atom:published", "", NS)
-    updated = entry.findtext("atom:updated", "", NS)
 
-    authors = [a.findtext("atom:name", "", NS) for a in entry.findall("atom:author", NS)]
+    if not matches_keywords(title, summary, keywords):
+        return _NO_KEYWORD
+
+    # RSS feed uses <dc:creator> (single comma-separated string), not <atom:author>.
+    authors = []
+    creator = entry.findtext("dc:creator", "", NS)
+    if creator:
+        authors = [a.strip() for a in creator.split(",") if a.strip()]
+    else:
+        authors = [a.findtext("atom:name", "", NS) for a in entry.findall("atom:author", NS)]
+
     categories = [c.attrib.get("term", "") for c in entry.findall("atom:category", NS)]
 
+    # Prefer <link rel="alternate" type="text/html"> for the human-readable abs URL.
+    html_url = ""
     pdf_url = None
     for link in entry.findall("atom:link", NS):
-        if link.attrib.get("title") == "pdf":
-            pdf_url = link.attrib.get("href")
-            break
+        rel = link.attrib.get("rel", "")
+        typ = link.attrib.get("type", "")
+        link_title = link.attrib.get("title", "")
+        href = link.attrib.get("href", "")
+        if link_title == "pdf" or typ == "application/pdf":
+            pdf_url = href
+        elif rel == "alternate" and typ == "text/html":
+            html_url = href
     if not pdf_url:
         pdf_url = f"https://arxiv.org/pdf/{base_id}.pdf"
+    if not html_url:
+        html_url = f"https://arxiv.org/abs/{base_id}"
 
     sid = safe_id(base_id)
     pdf_path = pdf_dir / f"{sid}.pdf"
@@ -143,7 +201,8 @@ def process_entry(entry, seen, pdf_dir, meta_dir, user_agent):
         "categories": categories,
         "published": published,
         "updated": updated,
-        "abs_url": abs_url,
+        "abs_url": html_url,
+        "feed_id": abs_url,
         "pdf_url": pdf_url,
         "pdf_path": str(pdf_path),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -158,15 +217,20 @@ def process_entry(entry, seen, pdf_dir, meta_dir, user_agent):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--keywords", nargs="+", required=True)
+    ap.add_argument("--cs-categories", nargs="+", required=True,
+                    help="例: cs.NI cs.DC cs.CR cs.SE")
+    ap.add_argument("--keywords", nargs="+", default=None,
+                    help="title/summary に対するクライアント側フィルタ。未指定なら全件通過")
     ap.add_argument("--out", default="./rag_inbox/arxiv")
-    ap.add_argument("--max-results", type=int, default=20,
-                    help="ページサイズ (1ページあたりの API 取得件数)")
-    ap.add_argument("--max-pages", type=int, default=20,
-                    help="安全上限。1 run あたり最大 max_results * max_pages 件まで遡る")
-    ap.add_argument("--cs-category", default=None, help="例: cs.AI, cs.CL, cs.CV")
+    ap.add_argument("--date-from", default=None,
+                    help="published 下限 (YYYY-MM-DD or YYYYMMDD)")
+    ap.add_argument("--date-to", default=None,
+                    help="published 上限 (YYYY-MM-DD or YYYYMMDD)")
+    ap.add_argument("--recent-days", type=int, default=None,
+                    help="--date-from 未指定時、直近N日を自動設定 (例: 3)")
     ap.add_argument("--user-agent", required=True, help="例: my-rag-bot/0.1 your@email.com")
-    ap.add_argument("--sleep", type=float, default=3.2)
+    ap.add_argument("--sleep", type=float, default=3.2,
+                    help="フィード取得・PDF DL の間隔(秒)")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -178,52 +242,56 @@ def main():
     seen_path = out_dir / "seen.json"
     seen = load_seen(seen_path)
 
-    query = build_query(args.keywords, args.cs_category)
+    if args.date_from:
+        date_from = parse_date_arg(args.date_from)
+    elif args.recent_days:
+        date_from = datetime.now(timezone.utc) - timedelta(days=args.recent_days)
+    else:
+        date_from = None
+
+    date_to = parse_date_arg(args.date_to) if args.date_to else None
 
     added = []
-    pages_fetched = 0
-    stop_reason = "max_pages"
+    feed_results = []
 
-    for page in range(args.max_pages):
-        start = page * args.max_results
-        entries = fetch_page(query, start, args.max_results, args.user_agent)
-        pages_fetched += 1
+    for category in args.cs_categories:
+        entries = fetch_feed(category, args.user_agent)
+        n_new = n_skip_seen = n_no_kw = n_old = n_too_new = 0
 
-        if not entries:
-            stop_reason = "no_more_entries"
-            break
-
-        # Snapshot seen *before* this page so we can detect "page is fully seen"
-        # — a true catch-up signal — independently of items we just added.
-        seen_before_page = set(seen)
-
-        page_new = 0
         for entry in entries:
-            base_id = process_entry(entry, seen, pdf_dir, meta_dir, args.user_agent)
-            if base_id is not None:
-                added.append(base_id)
-                page_new += 1
+            result = process_entry(entry, seen, pdf_dir, meta_dir,
+                                   args.user_agent, date_from, date_to,
+                                   args.keywords)
+            if result == _TOO_OLD:
+                n_old += 1
+            elif result == _TOO_NEW:
+                n_too_new += 1
+            elif result == _NO_KEYWORD:
+                n_no_kw += 1
+            elif result is None:
+                n_skip_seen += 1
+            else:
+                added.append(result)
+                n_new += 1
                 time.sleep(args.sleep)
 
-        page_ids = set()
-        for entry in entries:
-            abs_url = entry.findtext("atom:id", default="", namespaces=NS)
-            page_ids.add(re.sub(r"v\d+$", "", extract_arxiv_id(abs_url)))
-
-        if page_ids and page_ids.issubset(seen_before_page):
-            stop_reason = "caught_up"
-            break
-
+        feed_results.append({
+            "category": category,
+            "total_entries": len(entries),
+            "downloaded": n_new,
+            "skipped_seen": n_skip_seen,
+            "filtered_no_keyword": n_no_kw,
+            "filtered_too_old": n_old,
+            "filtered_too_new": n_too_new,
+        })
         time.sleep(args.sleep)
 
     save_seen(seen_path, seen)
 
     print(json.dumps({
-        "query": query,
+        "feeds": feed_results,
         "downloaded": added,
         "count": len(added),
-        "pages_fetched": pages_fetched,
-        "stop_reason": stop_reason,
         "out": str(out_dir),
     }, ensure_ascii=False, indent=2))
 
