@@ -1708,6 +1708,25 @@ async function runFACR(groupId, btn) {
   btn.textContent = "⚔️ FACR…";
   setStatus(`FACR: round 0 — collecting baseline (${labs.length} Labs)`);
 
+  // Pause the background polls (heartbeat / users / qa-timeline / labs /
+  // eligibility) for the duration of FACR. They all flow through the
+  // same proxy-tunnel WebSocket as cross_examine, and the ALB in front
+  // of that tunnel has a 60s idle timeout — when a background poll
+  // arrives while a slow cross_examine (2048-token stance classifier,
+  // typically 30-90s) is mid-flight, the proxy serializes them onto
+  // the same connection and the second-in-line request 504s. Observed
+  // pattern: every FACR run, exactly one cross_examine per round dies
+  // with 504 even after we serialized the FACR calls themselves —
+  // because the *background* polls were the actual contenders.
+  // startPolling() at the bottom of the finally is a no-op if pollTimer
+  // is already set (guard inside startPolling), so this is safe even
+  // if the user logs out mid-FACR.
+  const _facrPollWasRunning = pollTimer !== null;
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
   // Cumulative Δ per Lab (this is the "confidence" in FACR terms — Σ_k Δ).
   const cumulative = new Map(labs.map((x) => [x.opId, 0]));
   // Running evidence pool (text snippets) shared across rounds. Seeded
@@ -1751,19 +1770,38 @@ async function runFACR(groupId, btn) {
     console.warn("[FACR] baseline seeding failed, falling back to empty prior:", err);
   }
   // Per-round telemetry the FACR card renders below.
-  const roundsLog = [];   // [{k, perLab: [{labId, delta, stances, evCount}]}]
+  // - perLab[] keeps the small aggregate the grid view uses.
+  // - examinations[] keeps the full per-pair detail (per-evidence Δ,
+  //   query_augmented, etc.) so the "copy evaluation JSON" button can
+  //   emit a paper-5.2-compatible trace without re-running anything.
+  const roundsLog = [];
   let prevDeltas = new Map(labs.map((x) => [x.opId, 0]));
+  // Determined the moment a break fires; "k_max" if the for-loop runs to
+  // completion. Captured into facrState so the trace JSON can record
+  // which of paper D7's three conditions actually fired.
+  let stopReason = "k_max";
+  let stopGap = 0;
 
   try {
     for (let k = 1; k <= FACR_K_MAX; k++) {
       setStatus(`FACR: round ${k}/${FACR_K_MAX}`);
       // Per-round Δ accumulator. Each Lab examines every peer's claim
-      // once; the calls are independent so we issue them in parallel.
-      const calls = [];
+      // once. Calls are issued SEQUENTIALLY rather than in parallel:
+      // proxy-tunnel/ELB has a ~60s idle timeout, and cross_examine
+      // bundles an LLM stance-classifier call with max_new_tokens=2048
+      // that can run 30-60s on gpt-oss (analysis channel dominates the
+      // budget). Two such calls running concurrently through one tunnel
+      // reliably tripped 504 on whichever peer the proxy serialized
+      // second — see the 504/k=1 lab-A failure trace from the first
+      // run. Sequential keeps each request well under the idle timeout
+      // at the cost of doubling round latency. We retain the
+      // settled[] shape (fulfilled/rejected with value/reason) so the
+      // downstream aggregation logic does not need to change.
+      const settled = [];
       for (const examiner of labs) {
         for (const peer of labs) {
           if (peer.opId === examiner.opId) continue;
-          calls.push((async () => {
+          try {
             const resp = await chat({
               stage: "qa",
               slide: currentSlidePayload(),
@@ -1775,22 +1813,24 @@ async function runFACR(groupId, btn) {
               priorEvidence,
               roundIdx: k,
             });
-            return { examiner, peer, resp };
-          })());
+            settled.push({ status: "fulfilled", value: { examiner, peer, resp } });
+          } catch (err) {
+            settled.push({ status: "rejected", reason: err });
+          }
         }
       }
-      const settled = await Promise.allSettled(calls);
 
       const perLabDelta = new Map(labs.map((x) => [x.opId, 0]));
       const perLabStances = new Map(labs.map((x) => [x.opId, []]));
       const perLabEv = new Map(labs.map((x) => [x.opId, 0]));
       const newEvidenceTexts = [];
+      const examinations = [];   // per (examiner, target) detail for this round
       for (const s of settled) {
         if (s.status !== "fulfilled") {
           console.warn("[FACR] cross_examine call failed:", s.reason);
           continue;
         }
-        const { examiner, resp } = s.value;
+        const { examiner, peer, resp } = s.value;
         const acc = resp?.accuracy || {};
         const delta = Number(acc.delta) || 0;
         perLabDelta.set(examiner.opId, (perLabDelta.get(examiner.opId) || 0) + delta);
@@ -1803,10 +1843,33 @@ async function runFACR(groupId, btn) {
             newEvidenceTexts.push(e.text.trim());
           }
         }
+        examinations.push({
+          examiner_opId: examiner.opId,
+          examiner_labId: examiner.labId,
+          examiner_label: examiner.label,
+          target_opId: peer.opId,
+          target_labId: peer.labId,
+          target_label: peer.label,
+          claim_excerpt: (peer.answer || "").slice(0, 240),
+          query_original: acc.query_original || "",
+          query_augmented: acc.query_augmented || "",
+          delta,
+          note: acc.note || "",
+          evidence: ev.map((e) => ({
+            relevance: Number(e.relevance) || 0,
+            novelty: Number(e.novelty) || 0,
+            stance: e.stance || "NEUTRAL",
+            contrib: Number(e.delta) || 0,
+            score: Number(e.score) || 0,
+            title: e.title || "",
+            source: e.source || "",
+            text_excerpt: (e.text || "").slice(0, 200),
+          })),
+        });
       }
 
       // Update cumulative confidence + log this round.
-      const roundEntry = { k, perLab: [] };
+      const roundEntry = { k, perLab: [], examinations };
       let saturated = true;
       for (const lab of labs) {
         const d = perLabDelta.get(lab.opId) || 0;
@@ -1836,11 +1899,21 @@ async function runFACR(groupId, btn) {
       const gap = sortedCum.length >= 2 ? (sortedCum[0] - sortedCum[1]) : 0;
       if (gap >= FACR_DOMINANCE) {
         setStatus(`FACR: dominant winner at round ${k} (gap=${gap.toFixed(2)})`);
+        stopReason = "dominance";
+        stopGap = gap;
         break;
       }
       if (saturated && k >= 2) {
         setStatus(`FACR: saturated at round ${k}`);
+        stopReason = "saturation";
+        stopGap = gap;
         break;
+      }
+      // Fell through both checks at the last allowed k: record k_max
+      // explicitly with the gap as of that round so the trace JSON has
+      // it even when no early-stop fired.
+      if (k === FACR_K_MAX) {
+        stopGap = gap;
       }
     }
 
@@ -1849,11 +1922,26 @@ async function runFACR(groupId, btn) {
       confidence: Object.fromEntries(cumulative),
       labs: labs.map((x) => ({ opId: x.opId, labId: x.labId, label: x.label })),
       question,
+      stop: {
+        reason: stopReason,
+        at_round: roundsLog.length,
+        gap: Number(stopGap.toFixed(4)),
+      },
+      params: {
+        k_max: FACR_K_MAX,
+        epsilon: FACR_EPSILON,
+        tau_dom: FACR_DOMINANCE,
+      },
     });
     renderFacrCard(groupId);
   } finally {
     btn.disabled = false;
     btn.textContent = "⚔️ FACR";
+    // Resume background polls (heartbeat / users / timeline / labs /
+    // eligibility). Only restart if they were running when FACR began
+    // — startPolling has its own re-entry guard, but skipping the
+    // call avoids stomping on a logged-out state.
+    if (_facrPollWasRunning) startPolling();
   }
 }
 
@@ -1960,11 +2048,125 @@ function renderFacrCard(groupId) {
   }
   card.appendChild(grid);
 
+  // Footer: copy-to-clipboard for the full facr-trace-v1 evaluation JSON.
+  // Lets the operator paste a complete per-round trace (Δ components,
+  // query_augmented for D5 verification, stop reason for D7) into the
+  // evaluation notebook without server round-trips.
+  const foot = document.createElement("div");
+  foot.className = "facr-foot";
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "facr-copy-btn";
+  copyBtn.textContent = "📋 評価JSONをコピー";
+  copyBtn.addEventListener("click", async () => {
+    try {
+      const trace = buildFacrTrace(groupId);
+      await navigator.clipboard.writeText(JSON.stringify(trace, null, 2));
+      copyBtn.textContent = "✅ コピー済み";
+      setTimeout(() => { copyBtn.textContent = "📋 評価JSONをコピー"; }, 1500);
+    } catch (err) {
+      console.warn("[FACR] copy failed:", err);
+      copyBtn.textContent = "❌ コピー失敗 (consoleを確認)";
+      setTimeout(() => { copyBtn.textContent = "📋 評価JSONをコピー"; }, 2500);
+    }
+  });
+  foot.appendChild(copyBtn);
+  card.appendChild(foot);
+
   // Anchor: append to the end of the QA body so it sits below the group's
   // items. (The group is contiguous in DOM order because timeline merges
   // by ts and items in one fan-out arrive within the same poll cycle.)
   elQaBody.appendChild(card);
   elQaBody.scrollTop = elQaBody.scrollHeight;
+}
+
+// Assemble the full facr-trace-v1 evaluation JSON for one group from
+// the captured state. This is the artifact the user pastes into the
+// evaluation workbook to check paper §5.2 indicators:
+//   - ΣΔ convergence: per-round perLab.delta + cumulative
+//   - novelty持続性: examinations[].evidence[].novelty across rounds
+//   - D5 query steering: query_augmented vs query_original per round
+//   - D7 stop condition: stop.{reason, at_round, gap}
+function buildFacrTrace(groupId) {
+  const state = facrState.byGroup.get(groupId);
+  if (!state) throw new Error(`no FACR state for group ${groupId}`);
+  const cum = state.confidence || {};
+
+  // Paper §4.3-4.5 attributes Δ_i to the claim author L_i (the lab whose
+  // claim is being cross-examined). The orchestrator here accumulates Δ
+  // under the EXAMINER instead — examiner.opId += delta — so
+  // `cumulative[labX]` is "how much K_labX supported the OPPOSING claim",
+  // not "how defensible labX's own claim is". To avoid confusing readers
+  // of the trace, we expose both views explicitly:
+  //   - most_supportive_corpus_lab : sort by `cumulative`. Highest =
+  //     lab whose corpus did the most supportive work for the opposing
+  //     claim. This is what the implementation natively tracks.
+  //   - claim_conf / claim_winner_lab : re-aggregate from
+  //     examinations[].target_lab so each lab's claim accumulates the Δ
+  //     produced by every peer's K against it. This matches the paper's
+  //     `conf_i ← conf_i + Δ_i(k)` semantics — high claim_conf means
+  //     the claim withstood (and was supported by) cross-examination.
+  // In the 2-lab case these two winners are necessarily opposite labs,
+  // which is the easy sanity check for the inversion.
+  const sortedCorpus = state.labs
+    .map((l) => ({ labId: l.labId, label: l.label, cum: Number(cum[l.opId]) || 0 }))
+    .sort((a, b) => b.cum - a.cum);
+  const mostSupportiveCorpus = sortedCorpus.length ? sortedCorpus[0].labId : null;
+
+  const claimConf = {};
+  for (const lab of state.labs) claimConf[lab.labId] = 0;
+  for (const round of state.rounds) {
+    for (const ex of (round.examinations || [])) {
+      const target = ex.target_labId;
+      if (target && target in claimConf) {
+        claimConf[target] += Number(ex.delta) || 0;
+      }
+    }
+  }
+  const sortedClaim = Object.entries(claimConf)
+    .map(([labId, conf]) => ({ labId, conf }))
+    .sort((a, b) => b.conf - a.conf);
+  const claimWinner = sortedClaim.length ? sortedClaim[0].labId : null;
+
+  return {
+    schema: "facr-trace-v2",
+    ts: new Date().toISOString(),
+    group_id: groupId,
+    question: state.question || "",
+    labs: state.labs.map((l) => ({ opId: l.opId, labId: l.labId, label: l.label })),
+    params: state.params || { k_max: FACR_K_MAX, epsilon: FACR_EPSILON, tau_dom: FACR_DOMINANCE },
+    rounds: state.rounds.map((r) => ({
+      k: r.k,
+      per_lab: (r.perLab || []).map((p) => ({
+        labId: p.labId,
+        label: p.label,
+        delta: Number(p.delta) || 0,
+        stance_summary: p.stanceSummary,
+        ev_count: p.evCount,
+      })),
+      examinations: (r.examinations || []).map((e) => ({
+        examiner_lab: e.examiner_labId,
+        target_lab: e.target_labId,
+        claim_excerpt: e.claim_excerpt,
+        query_original: e.query_original,
+        query_augmented: e.query_augmented,
+        delta: Number(e.delta) || 0,
+        note: e.note,
+        evidence: e.evidence,
+      })),
+    })),
+    stop: state.stop || { reason: "unknown", at_round: state.rounds.length, gap: 0 },
+    // Σ Δ accumulated under the examiner — implementation's native view.
+    // = "labX's corpus supported the opposing claim by this much".
+    cumulative: Object.fromEntries(
+      state.labs.map((l) => [l.labId, Number(cum[l.opId]) || 0])
+    ),
+    most_supportive_corpus_lab: mostSupportiveCorpus,
+    // Σ Δ re-aggregated under the claim author (paper §4.5 conf_i).
+    // = "labX's own claim accumulated this much support from peer corpora".
+    claim_conf: claimConf,
+    claim_winner_lab: claimWinner,
+  };
 }
 
 function facrCell(text, cls) {

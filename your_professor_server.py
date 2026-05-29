@@ -1576,6 +1576,8 @@ def _facr_cross_examine(
             "evidence": [],
             "components": {"relevance": [], "novelty": [], "support": []},
             "stances": [],
+            "query_original": claim,
+            "query_augmented": claim,
             "note": "rag_unavailable",
         }
     query = _build_facr_retrieval_query(claim, prior_evidence)
@@ -1586,6 +1588,8 @@ def _facr_cross_examine(
             "evidence": [],
             "components": {"relevance": [], "novelty": [], "support": []},
             "stances": [],
+            "query_original": claim,
+            "query_augmented": query,
             "note": "no_hits",
         }
 
@@ -1681,6 +1685,8 @@ def _facr_cross_examine(
             "support": [stance_val.get(s, 0.0) for s in stances],
         },
         "stances": stances,
+        "query_original": claim,
+        "query_augmented": query,
         "note": "ok",
     }
 
@@ -2130,6 +2136,9 @@ async def chat(req: ChatRequest, request: Request):
             "round_idx": req.round_idx,
             "stances": stances,
             "evidence": result.get("evidence") or [],
+            "query_original": result.get("query_original", ""),
+            "query_augmented": result.get("query_augmented", ""),
+            "note": result.get("note", ""),
         }
         _touch_presence(req.user_id)
         return ChatResponse(
