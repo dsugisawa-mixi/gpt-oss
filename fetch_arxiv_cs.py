@@ -72,11 +72,17 @@ def parse_date_arg(s):
     return datetime.strptime(s[:8], "%Y%m%d").replace(tzinfo=timezone.utc)
 
 
+def _keyword_pattern(keyword):
+    # Word-boundary match so "QUIC" does not hit "quickly"/"QuickFPS"/"arquicanedo".
+    # Lookarounds (not \b) so punctuation-bearing tokens like "HTTP/3" still match.
+    return re.compile(r"(?<!\w)" + re.escape(keyword) + r"(?!\w)", re.IGNORECASE)
+
+
 def matches_keywords(title, summary, keywords):
     if not keywords:
         return True
-    hay = (title + " " + summary).lower()
-    return any(k.lower() in hay for k in keywords)
+    hay = title + " " + summary
+    return any(_keyword_pattern(k).search(hay) for k in keywords)
 
 def load_seen(path: Path):
     if path.exists():
